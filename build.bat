@@ -30,8 +30,8 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-echo [3/4] Packaging standalone executable with PyInstaller...
-python -m PyInstaller --onefile --windowed --name TextToSpeechBatch --collect-all google.genai --collect-all lameenc --collect-all docx --clean tts_gui.py
+echo [3/4] Packaging directory build (lightweight exe with _internal folder)...
+python -m PyInstaller --onedir --windowed --name TextToSpeechBatch --collect-all google.genai --collect-all lameenc --collect-all docx --clean tts_gui.py
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] PyInstaller packaging failed.
     pause
@@ -39,14 +39,14 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [4/4] Verifying output executable...
-if exist "dist\TextToSpeechBatch.exe" (
+if exist "dist\TextToSpeechBatch\TextToSpeechBatch.exe" (
     echo =========================================================
     echo [SUCCESS] Build succeeded!
-    echo Standalone executable created at:
-    echo %CD%\dist\TextToSpeechBatch.exe
+    echo Application executable created at:
+    echo %CD%\dist\TextToSpeechBatch\TextToSpeechBatch.exe
     echo =========================================================
 ) else (
-    echo [ERROR] dist\TextToSpeechBatch.exe was not found.
+    echo [ERROR] dist\TextToSpeechBatch\TextToSpeechBatch.exe was not found.
     pause
     exit /b 1
 )
