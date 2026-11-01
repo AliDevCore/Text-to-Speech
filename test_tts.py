@@ -27,10 +27,12 @@ from tts_gui import (
     classify_error,
     split_text_into_chunks,
     check_output_collisions,
+    get_unique_output_path,
     extract_text,
     extract_text_from_txt,
     extract_text_from_docx,
     resolve_style_instruction,
+    clean_style_instruction,
     build_prompt,
     parse_sample_rate,
     save_pcm_as_mp3,
@@ -49,7 +51,6 @@ class TestChunking(unittest.TestCase):
         self.assertEqual(chunks[0], text)
 
     def test_decimals_times_and_urls_preserved(self):
-        # Must not split 46.5 or 10:30 into separate parts with inserted spaces
         t1 = "Profit was 46.5 percent at 10:30 today."
         chunks1 = split_text_into_chunks(t1, max_chars=3000)
         self.assertEqual(len(chunks1), 1)
@@ -67,7 +68,6 @@ class TestChunking(unittest.TestCase):
         self.assertEqual(chunks3[0], t3)
 
     def test_exact_substring_and_whitespace_equality(self):
-        # Long mixed text with numbers, URLs, Persian sentences, and multiple paragraphs
         t4 = (
             "Paragraph one has 46.5% profit at 10:30.\nLine two is continuous.\n\n"
             "Paragraph two references https://example.com/a.b and 3.14 value.\n"
@@ -77,12 +77,10 @@ class TestChunking(unittest.TestCase):
         chunks = split_text_into_chunks(t4, max_chars=350)
         self.assertGreater(len(chunks), 1)
 
-        # Every chunk must be <= max_chars
         for c in chunks:
             self.assertLessEqual(len(c), 350)
             self.assertIn(c, t4.strip())
 
-        # Whitespace-stripped representation must match original exactly (no content lost)
         clean_original = re.sub(r"\s+", "", t4)
         clean_reconstructed = re.sub(r"\s+", "", "".join(chunks))
         self.assertEqual(clean_reconstructed, clean_original)
@@ -103,24 +101,19 @@ class TestChunking(unittest.TestCase):
 
 class TestErrorClassification(unittest.TestCase):
     def test_auth_errors(self):
-        # HTTP 401
         err_401 = APIError(401, {"error": {"code": 401, "message": "API_KEY_INVALID"}})
         self.assertEqual(classify_error(err_401).kind, "auth")
 
-        # HTTP 403 PERMISSION_DENIED
         err_403 = APIError(403, {"error": {"code": 403, "message": "The caller does not have permission", "status": "PERMISSION_DENIED"}})
         self.assertEqual(classify_error(err_403).kind, "auth")
 
-        # Explicit message mentioning invalid key
         err_key = Exception("Google API error: API key not valid. Please pass a valid API key.")
         self.assertEqual(classify_error(err_key).kind, "auth")
 
     def test_region_errors(self):
-        # 400 FAILED_PRECONDITION location unsupported
         err_loc = APIError(400, {"error": {"code": 400, "message": "User location is not supported for the API use.", "status": "FAILED_PRECONDITION"}})
         self.assertEqual(classify_error(err_loc).kind, "region")
 
-        # Location unsupported in generic message
         err_loc2 = Exception("Location is not supported in your territory")
         self.assertEqual(classify_error(err_loc2).kind, "region")
 
@@ -137,43 +130,64 @@ class TestErrorClassification(unittest.TestCase):
         self.assertEqual(classify_error(err_rate).kind, "rate_limit")
 
     def test_bad_request_fails_only_current_file(self):
-        # 400 for invalid voice name
         err_voice = APIError(400, {"error": {"code": 400, "message": "Invalid voice name specified: UnknownVoice", "status": "INVALID_ARGUMENT"}})
         info = classify_error(err_voice)
         self.assertEqual(info.kind, "bad_request")
         self.assertIn("Invalid voice name", info.user_message)
 
     def test_transient_and_number_in_trace(self):
-        # 500 error whose text contains 5403211 trace id must NOT be classified as auth 403!
         err_500 = APIError(500, "500 Internal Server Error, trace ID: 540321199")
         info = classify_error(err_500)
         self.assertEqual(info.kind, "transient")
         self.assertNotEqual(info.kind, "auth")
 
-        # TimeoutError
         err_timeout = TimeoutError("Request timed out after 180s")
         self.assertEqual(classify_error(err_timeout).kind, "transient")
 
 
-class TestOutputCollisions(unittest.TestCase):
-    def test_collision_detected(self):
-        files = [
-            os.path.join("C:", "docs", "report.txt"),
-            os.path.join("C:", "docs", "report.docx"),
-        ]
-        collisions = check_output_collisions(files)
-        self.assertEqual(len(collisions), 1)
-        out_key = list(collisions.keys())[0]
-        self.assertTrue(out_key.endswith("report.mp3"))
-        self.assertEqual(len(collisions[out_key]), 2)
+class TestOutputNamingAndCollisions(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
 
-    def test_no_collision_different_names(self):
-        files = [
-            os.path.join("C:", "docs", "doc1.txt"),
-            os.path.join("C:", "docs", "doc2.docx"),
-        ]
-        collisions = check_output_collisions(files)
-        self.assertEqual(len(collisions), 0)
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_unique_output_path_increments_when_file_exists(self):
+        base_path = os.path.join(self.temp_dir, "report.mp3")
+        # When report.mp3 does not exist:
+        p0 = get_unique_output_path(base_path)
+        self.assertEqual(p0, base_path)
+
+        # Create report.mp3 on disk
+        with open(base_path, "wb") as f:
+            f.write(b"dummy")
+
+        # Now get_unique_output_path must return report1.mp3
+        p1 = get_unique_output_path(base_path)
+        self.assertEqual(p1, os.path.join(self.temp_dir, "report1.mp3"))
+
+        # Create report1.mp3 on disk
+        with open(p1, "wb") as f:
+            f.write(b"dummy1")
+
+        # Now get_unique_output_path must return report2.mp3
+        p2 = get_unique_output_path(base_path)
+        self.assertEqual(p2, os.path.join(self.temp_dir, "report2.mp3"))
+
+    def test_unique_output_path_with_reserved_set(self):
+        base_path = os.path.join(self.temp_dir, "test.mp3")
+        reserved = set()
+
+        r1 = get_unique_output_path(base_path, reserved)
+        reserved.add(os.path.normcase(os.path.abspath(r1)))
+        self.assertEqual(r1, base_path)
+
+        r2 = get_unique_output_path(base_path, reserved)
+        reserved.add(os.path.normcase(os.path.abspath(r2)))
+        self.assertEqual(r2, os.path.join(self.temp_dir, "test1.mp3"))
+
+        r3 = get_unique_output_path(base_path, reserved)
+        self.assertEqual(r3, os.path.join(self.temp_dir, "test2.mp3"))
 
 
 class TestDocxExtraction(unittest.TestCase):
@@ -184,7 +198,6 @@ class TestDocxExtraction(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_merged_cell_deduplication(self):
-        # Test that merged table cells in Word docx are read only once
         docx_path = os.path.join(self.temp_dir, "merged.docx")
         doc = docx.Document()
 
@@ -200,12 +213,10 @@ class TestDocxExtraction(unittest.TestCase):
 
         extracted = extract_text_from_docx(docx_path)
         self.assertIn("Intro Paragraph", extracted)
-        # Verify merged cell appears once and is not duplicated
         self.assertEqual(extracted.count("Merged Cell Value"), 1)
         self.assertIn("Row 2 Col 1 Row 2 Col 2", extracted)
 
     def test_sdt_content_control_extraction(self):
-        # Test that w:sdt and w:sdtContent elements are recursively traversed
         docx_path = os.path.join(self.temp_dir, "sdt.docx")
         doc = docx.Document()
         doc.add_paragraph("Paragraph before SDT")
@@ -233,7 +244,6 @@ class TestDocxExtraction(unittest.TestCase):
     def test_persian_docx_with_zwnj(self):
         docx_path = os.path.join(self.temp_dir, "persian.docx")
         doc = docx.Document()
-        # Persian: "He is going to school." with ZWNJ \u200c in "mi-ravad"
         p_text = "\u0645\u06cc\u200c\u0631\u0648\u062f \u0628\u0647 \u0645\u062f\u0631\u0633\u0647."
         doc.add_paragraph(p_text)
         doc.save(docx_path)
@@ -260,7 +270,6 @@ class TestTxtExtraction(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_cp1256_even_and_odd_byte_lengths(self):
-        # CP1256 text with odd byte length (9 bytes)
         odd_text = "\u0633\u0644\u0627\u0645 \u062c\u0647\u0627\u0646"
         odd_bytes = odd_text.encode("cp1256")
         self.assertEqual(len(odd_bytes), 9)
@@ -270,8 +279,6 @@ class TestTxtExtraction(unittest.TestCase):
             f.write(odd_bytes)
         self.assertEqual(extract_text_from_txt(f_odd), odd_text)
 
-        # CP1256 text with even byte length (10 bytes).
-        # Must NEVER falsely decode as UTF-16!
         even_text = "\u0633\u0644\u0627\u0645 \u062c\u0647\u0627\u0646!"
         even_bytes = even_text.encode("cp1256")
         self.assertEqual(len(even_bytes), 10)
@@ -283,13 +290,11 @@ class TestTxtExtraction(unittest.TestCase):
 
     def test_bom_detection(self):
         sample = "Sample text for BOM test."
-        # UTF-8 with BOM
         f_sig = os.path.join(self.temp_dir, "utf8_sig.txt")
         with open(f_sig, "wb") as f:
             f.write(sample.encode("utf-8-sig"))
         self.assertEqual(extract_text_from_txt(f_sig), sample)
 
-        # UTF-16 with BOM (LE)
         f_u16 = os.path.join(self.temp_dir, "utf16.txt")
         with open(f_u16, "wb") as f:
             f.write(sample.encode("utf-16"))
@@ -304,22 +309,26 @@ class TestTxtExtraction(unittest.TestCase):
 
 
 class TestPromptAndStyles(unittest.TestCase):
-    def test_build_prompt_neutral(self):
-        prompt = build_prompt("", "Content here.")
-        self.assertEqual(prompt, "## Transcript:\nContent here.")
+    def test_build_prompt_returns_verbatim_text_without_spoken_instruction(self):
+        chunk = "Speech transcript content to be spoken."
+        # Instruction must NOT be prepended to the text field to prevent Gemini from speaking it
+        prompt = build_prompt("Say in a cheerful tone:", chunk)
+        self.assertEqual(prompt, chunk)
 
-    def test_build_prompt_preset(self):
+    def test_clean_style_instruction(self):
         cheerful_label = "\u0634\u0627\u062f \u0648 \u067e\u0631\u0627\u0646\u0631\u0698\u06cc"
-        instruction = resolve_style_instruction(cheerful_label)
-        prompt = build_prompt(instruction, "Cheerful words.")
-        self.assertEqual(prompt, "Say in a cheerful, upbeat and energetic tone:\n\n## Transcript:\nCheerful words.")
+        clean = clean_style_instruction(cheerful_label)
+        self.assertEqual(clean, "cheerful, upbeat and energetic tone")
 
-    def test_custom_style_formatting(self):
-        inst1 = resolve_style_instruction("Talk slowly")
-        self.assertEqual(inst1, "Talk slowly:")
+        promo_label = "\u062a\u0628\u0644\u06cc\u063a\u0627\u062a\u06cc"
+        clean_promo = clean_style_instruction(promo_label)
+        self.assertEqual(clean_promo, "high-energy promotional tone with elongated vowels")
 
-        inst2 = resolve_style_instruction("Whisper:")
-        self.assertEqual(inst2, "Whisper:")
+        custom_style = clean_style_instruction("Say in a whispering tone:")
+        self.assertEqual(custom_style, "whispering tone")
+
+        free_text = clean_style_instruction("Mysterious and slow")
+        self.assertEqual(free_text, "Mysterious and slow")
 
 
 class TestAudioAndMockPipeline(unittest.TestCase):
@@ -357,17 +366,14 @@ class TestAudioAndMockPipeline(unittest.TestCase):
         cache_dir = get_file_cache_dir(txt_path, "Bodi", "")
         chunk1_cache = os.path.join(cache_dir, "1.pcm")
 
-        # Simulate chunk 1 already cached
         mock_pcm = b"\x00" * 4800
         with open(chunk1_cache, "wb") as f:
             f.write(mock_pcm)
 
         self.assertTrue(os.path.isfile(chunk1_cache))
-        # Cleanup
         shutil.rmtree(cache_dir, ignore_errors=True)
 
     def test_mock_pipeline_dual_format_and_stop_behavior(self):
-        # 1. Dual format processing (.txt and .docx)
         txt_path = os.path.join(self.temp_dir, "batch_item1.txt")
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write("Line one of text file.")
@@ -382,7 +388,6 @@ class TestAudioAndMockPipeline(unittest.TestCase):
             chunks = split_text_into_chunks(txt)
             self.assertEqual(len(chunks), 1)
 
-            # In mock pipeline, synthesize 0.2s silence per chunk
             silence = b"\x00" * int(24000 * 2 * 0.2)
             out_mp3 = os.path.splitext(path)[0] + ".mp3"
             save_pcm_as_mp3(silence, 24000, out_mp3)

@@ -3,7 +3,8 @@
 All source code, identifiers, comments, log messages, and UI labels are written in English.
 Style preset labels in Persian are represented strictly using \\uXXXX escape sequences.
 Features modern dark styling, direct in-place grid editing, structured error classification,
-exact substring chunking, robust encoding/docx extraction, caching with resume, and CLI selftest.
+exact substring chunking, robust encoding/docx extraction, non-spoken vocal styling,
+automatic duplicate output naming, copyable activity logs, and CLI selftest.
 """
 
 from dataclasses import dataclass
@@ -222,6 +223,38 @@ def load_api_key() -> str:
         return raw_key
     except Exception:
         return ""
+
+
+# ============================================================================
+# Output Naming & Collision Avoidance
+# ============================================================================
+
+def get_unique_output_path(target_path: str, reserved_paths: set[str] | None = None) -> str:
+    """Return a unique output path, appending numeric suffix (e.g. input1.mp3) if file exists or is reserved."""
+    norm_reserved = {os.path.normcase(os.path.abspath(p)) for p in reserved_paths} if reserved_paths else set()
+    norm_target = os.path.normcase(os.path.abspath(target_path))
+    if not os.path.exists(target_path) and norm_target not in norm_reserved:
+        return target_path
+
+    directory = os.path.dirname(target_path)
+    stem, ext = os.path.splitext(os.path.basename(target_path))
+    counter = 1
+    while True:
+        candidate_name = f"{stem}{counter}{ext}"
+        candidate_path = os.path.join(directory, candidate_name) if directory else candidate_name
+        norm_cand = os.path.normcase(os.path.abspath(candidate_path))
+        if not os.path.exists(candidate_path) and norm_cand not in norm_reserved:
+            return candidate_path
+        counter += 1
+
+
+def check_output_collisions(file_paths: list[str]) -> dict[str, list[str]]:
+    """Check if any input files would produce the same base output MP3 path."""
+    dest_map: dict[str, list[str]] = {}
+    for p in file_paths:
+        out_path = os.path.normcase(os.path.abspath(os.path.splitext(p)[0] + ".mp3"))
+        dest_map.setdefault(out_path, []).append(p)
+    return {out_path: files for out_path, files in dest_map.items() if len(files) > 1}
 
 
 # ============================================================================
@@ -546,12 +579,21 @@ def resolve_style_instruction(style_value: str) -> str:
     return text
 
 
+def clean_style_instruction(style_value: str) -> str:
+    """Extract clean style description without imperative prefixes (e.g. 'Say in a') or trailing colons."""
+    raw = resolve_style_instruction(style_value).strip()
+    clean = raw.rstrip(":").strip()
+    prefixes = ("say in a ", "say in an ", "say in ", "say like a ", "say like ")
+    lower_c = clean.lower()
+    for p in prefixes:
+        if lower_c.startswith(p):
+            return clean[len(p):].strip()
+    return clean
+
+
 def build_prompt(style_instruction: str, chunk: str) -> str:
-    """Build the request text for Gemini TTS in one isolated function."""
-    instruction = (style_instruction or "").strip()
-    if instruction:
-        return f"{instruction}\n\n## Transcript:\n{chunk}"
-    return f"## Transcript:\n{chunk}"
+    """Return verbatim text chunk for Gemini TTS synthesis, ensuring directions are never spoken."""
+    return chunk.strip()
 
 
 def parse_sample_rate(mime_type: str, default_rate: int = DEFAULT_SAMPLE_RATE) -> int:
@@ -597,15 +639,6 @@ def save_pcm_as_mp3(pcm_data: bytes, sample_rate: int, output_mp3_path: str):
             except OSError:
                 pass
         raise
-
-
-def check_output_collisions(file_paths: list[str]) -> dict[str, list[str]]:
-    """Check if any input files would produce the same output MP3 path."""
-    dest_map: dict[str, list[str]] = {}
-    for p in file_paths:
-        out_path = os.path.normcase(os.path.abspath(os.path.splitext(p)[0] + ".mp3"))
-        dest_map.setdefault(out_path, []).append(p)
-    return {out_path: files for out_path, files in dest_map.items() if len(files) > 1}
 
 
 # ============================================================================
@@ -957,10 +990,27 @@ class TTSBatchApp:
         self.progress_label.pack(side=tk.RIGHT)
 
         # --------------------------------------------------------------------
-        # Row 5: Activity Log Card (Always visible, expansive console)
+        # Row 5: Activity Log Card (Expansive, fully selectable & copyable console)
         # --------------------------------------------------------------------
         log_card = ttk.LabelFrame(main_container, text=" Activity Log ", padding="8")
         log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 2))
+
+        # Log Top Bar with Copy & Clear Actions
+        log_top_bar = ttk.Frame(log_card, style="Card.TFrame")
+        log_top_bar.pack(fill=tk.X, pady=(0, 4))
+
+        log_lbl = ttk.Label(log_top_bar, text="Console Output:", style="Card.TLabel")
+        log_lbl.pack(side=tk.LEFT)
+
+        self.copy_log_btn = ttk.Button(
+            log_top_bar, text="Copy Log", command=self._copy_all_logs, style="Secondary.TButton"
+        )
+        self.copy_log_btn.pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.clear_log_btn = ttk.Button(
+            log_top_bar, text="Clear Log", command=self._clear_logs, style="Secondary.TButton"
+        )
+        self.clear_log_btn.pack(side=tk.RIGHT)
 
         self.log_text = ScrolledText(
             log_card,
@@ -988,6 +1038,7 @@ class TTSBatchApp:
         # Attach universal clipboard handling (context menu & keycodes)
         self._attach_universal_clipboard(self.api_entry)
         self._attach_universal_clipboard(self.style_cb)
+        self._attach_log_clipboard(self.log_text)
 
     # ------------------------------------------------------------------------
     # In-Place Grid Editing (Voice & Style)
@@ -1135,6 +1186,88 @@ class TTSBatchApp:
                 messagebox.showinfo("Clipboard Empty", "The clipboard does not contain any text.")
         except Exception as exc:
             messagebox.showinfo("Clipboard Notice", f"Unable to read clipboard: {exc}")
+
+    def _copy_all_logs(self):
+        """Copy selected log text or entire log to clipboard."""
+        try:
+            try:
+                sel = self.log_text.selection_get()
+            except Exception:
+                sel = ""
+            if not sel:
+                sel = self.log_text.get("1.0", tk.END).strip()
+            if sel:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(sel)
+                self.log("Copied activity log to clipboard.", "ok")
+            else:
+                messagebox.showinfo("Log Empty", "The activity log is currently empty.")
+        except Exception as exc:
+            messagebox.showinfo("Clipboard Notice", f"Unable to copy log: {exc}")
+
+    def _clear_logs(self):
+        """Clear all contents from the activity log widget."""
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state="disabled")
+
+    def _attach_log_clipboard(self, widget: ScrolledText):
+        """Attach right-click context menu and universal copy/select shortcuts to log widget."""
+        menu = tk.Menu(
+            widget,
+            tearoff=0,
+            bg=COLOR_INPUT_BG,
+            fg=COLOR_TEXT_PRIMARY,
+            activebackground=COLOR_ACCENT_BLUE,
+            activeforeground="#ffffff",
+            bd=1,
+            relief="solid",
+        )
+
+        def do_copy():
+            try:
+                try:
+                    sel = widget.selection_get()
+                except Exception:
+                    sel = ""
+                if not sel:
+                    sel = widget.get("1.0", tk.END).strip()
+                if sel:
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(sel)
+            except Exception:
+                pass
+
+        def do_select_all():
+            widget.tag_add(tk.SEL, "1.0", tk.END)
+
+        def do_clear():
+            self._clear_logs()
+
+        menu.add_command(label="Copy", command=do_copy)
+        menu.add_command(label="Select All", command=do_select_all)
+        menu.add_separator()
+        menu.add_command(label="Clear Log", command=do_clear)
+
+        def show_popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", show_popup)
+
+        def on_ctrl_key(event):
+            if event.state & 4:
+                # 67 = 'C', 65 = 'A' across all keyboard layouts
+                if event.keycode == 67:
+                    do_copy()
+                    return "break"
+                elif event.keycode == 65:
+                    do_select_all()
+                    return "break"
+
+        widget.bind("<Control-KeyPress>", on_ctrl_key)
 
     def _attach_universal_clipboard(self, widget: tk.Widget):
         """Attach right-click context menu and keyboard-layout-independent shortcuts."""
@@ -1377,7 +1510,6 @@ class TTSBatchApp:
             return
 
         file_records: list[tuple[str, str, str, str]] = []
-        file_paths = []
         for item in items:
             f_path = self.tree.set(item, "filepath")
             f_voice = self.tree.set(item, "voice")
@@ -1386,20 +1518,6 @@ class TTSBatchApp:
                 messagebox.showerror("File Not Found", f"File does not exist:\n{f_path}\n\nPlease check or remove it.")
                 return
             file_records.append((item, f_path, f_voice, f_style))
-            file_paths.append(f_path)
-
-        collisions = check_output_collisions(file_paths)
-        if collisions:
-            collision_details = []
-            for out_p, files in collisions.items():
-                collision_details.append(f"Output: {out_p}\nConflicting input files:\n  - " + "\n  - ".join(files))
-            msg = (
-                "Output name collisions detected! The following files would overwrite each other:\n\n"
-                + "\n\n".join(collision_details)
-                + "\n\nPlease rename or remove conflicting files before starting."
-            )
-            messagebox.showerror("Output Path Collision", msg)
-            return
 
         self.is_processing = True
         self.stop_event.clear()
@@ -1431,7 +1549,7 @@ class TTSBatchApp:
         self.progress_label.configure(text="Stopping...")
 
     def _worker_thread(self, file_records: list[tuple[str, str, str, str]], api_key: str):
-        """Sequential background processing worker with caching, rate limiting, and structured error control."""
+        """Sequential background processing worker with non-spoken styling, unique output naming, and caching."""
         is_mock = os.environ.get("TTS_MOCK") == "1"
         client = None
 
@@ -1450,14 +1568,26 @@ class TTSBatchApp:
                 self.queue.put(("auth_error", f"Failed to initialize Gemini API client: {err_info.user_message}"))
                 return
 
-        # Pre-extract, inspect and chunk all files
+        # Pre-extract, inspect and chunk all files, assigning collision-free output paths
         prepared_files: list[dict] = []
+        reserved_outputs: set[str] = set()
         total_chunks = 0
 
         for item_id, file_path, voice, style in file_records:
             base_name = os.path.basename(file_path)
             ext = os.path.splitext(base_name)[1].lower()
             self.queue.put(("log", f"Inspecting and extracting text from '{base_name}' ({ext})...", "info"))
+
+            base_output_mp3 = os.path.splitext(file_path)[0] + ".mp3"
+            unique_output_mp3 = get_unique_output_path(base_output_mp3, reserved_outputs)
+            reserved_outputs.add(os.path.normcase(os.path.abspath(unique_output_mp3)))
+
+            if os.path.normcase(os.path.abspath(unique_output_mp3)) != os.path.normcase(os.path.abspath(base_output_mp3)):
+                self.queue.put((
+                    "log",
+                    f"  Existing file detected for '{os.path.basename(base_output_mp3)}'. Auto-assigned unique output: '{os.path.basename(unique_output_mp3)}'.",
+                    "warn",
+                ))
 
             try:
                 text = extract_text(file_path)
@@ -1477,6 +1607,7 @@ class TTSBatchApp:
                 prepared_files.append({
                     "item_id": item_id,
                     "file_path": file_path,
+                    "output_mp3": unique_output_mp3,
                     "voice": voice,
                     "style": style,
                     "chunks": chunks,
@@ -1488,6 +1619,7 @@ class TTSBatchApp:
                 prepared_files.append({
                     "item_id": item_id,
                     "file_path": file_path,
+                    "output_mp3": unique_output_mp3,
                     "voice": voice,
                     "style": style,
                     "chunks": [],
@@ -1506,6 +1638,7 @@ class TTSBatchApp:
         for file_info in prepared_files:
             item_id = file_info["item_id"]
             file_path = file_info["file_path"]
+            output_mp3 = file_info["output_mp3"]
             voice = file_info["voice"]
             style = file_info["style"]
             chunks = file_info["chunks"]
@@ -1525,16 +1658,17 @@ class TTSBatchApp:
                 self.queue.put(("log", f"Skipping '{base_name}' due to error: {preload_error}", "err"))
                 continue
 
-            output_mp3 = os.path.splitext(file_path)[0] + ".mp3"
             pcm_accumulator = bytearray()
             detected_sample_rate = DEFAULT_SAMPLE_RATE
             num_chunks = len(chunks)
             file_failed = False
             file_err_info: ErrorInfo | None = None
             resolved_style = resolve_style_instruction(style)
-            file_cache_dir = get_file_cache_dir(file_path, voice, resolved_style)
+            clean_style = clean_style_instruction(resolved_style)
+            file_cache_dir = get_file_cache_dir(file_path, voice, clean_style)
 
-            self.queue.put(("log", f"Processing '{base_name}' ({num_chunks} chunks, Voice: '{voice}', Style: '{style}')...", "info"))
+            style_desc = f"'{clean_style}'" if clean_style else "Neutral"
+            self.queue.put(("log", f"Processing '{base_name}' ({num_chunks} chunks, Voice: '{voice}', Style: {style_desc})...", "info"))
             chunks_completed_for_file = 0
 
             for idx, chunk in enumerate(chunks, start=1):
@@ -1545,7 +1679,6 @@ class TTSBatchApp:
 
                 self.queue.put(("item_status", item_id, f"Processing (chunk {idx}/{num_chunks})"))
 
-                prompt_text = build_prompt(resolved_style, chunk)
                 cache_file = os.path.join(file_cache_dir, f"{idx}.pcm")
 
                 # Check if this chunk is already cached from an earlier stopped run
@@ -1582,14 +1715,15 @@ class TTSBatchApp:
                         break
 
                     self.queue.put(("log", f"Sending chunk {idx}/{num_chunks} ({len(chunk):,} chars) to Gemini TTS...", "info"))
-                    if resolved_style:
-                        self.queue.put(("log", f"  Instruction: \"{resolved_style}\"", "sub"))
+                    if clean_style:
+                        self.queue.put(("log", f"  Applied vocal style metadata: \"{clean_style}\"", "sub"))
 
                     last_request_time = time.time()
                     chunk_pcm, chunk_rate, err_info, was_rate_limited = self._fetch_audio_chunk_with_retry(
                         client=client,
-                        prompt_text=prompt_text,
+                        chunk_text=chunk,
                         voice=voice,
+                        clean_style=clean_style,
                         is_mock=is_mock,
                         chunk_idx=idx,
                         total_chunks=num_chunks,
@@ -1666,9 +1800,16 @@ class TTSBatchApp:
             self.queue.put(("batch_done", None))
 
     def _fetch_audio_chunk_with_retry(
-        self, client: genai.Client | None, prompt_text: str, voice: str, is_mock: bool, chunk_idx: int, total_chunks: int
+        self,
+        client: genai.Client | None,
+        chunk_text: str,
+        voice: str,
+        clean_style: str,
+        is_mock: bool,
+        chunk_idx: int,
+        total_chunks: int,
     ) -> tuple[bytes, int, ErrorInfo | None, bool]:
-        """Fetch TTS audio for a single chunk with structured error classification and retry handling."""
+        """Fetch TTS audio for a single chunk with non-spoken vocal styling metadata and retry handling."""
         if is_mock:
             time.sleep(0.08)
             return b"\x00" * (DEFAULT_SAMPLE_RATE * 2), DEFAULT_SAMPLE_RATE, None, False
@@ -1687,10 +1828,16 @@ class TTSBatchApp:
                 return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
 
             try:
+                # Isolate style instruction in speech_metadata so the model never reads it aloud as transcript
+                speech_metadata = types.SpeechMetadata(style=clean_style) if clean_style else None
+                part = types.Part(
+                    text=chunk_text,
+                    speech_metadata=speech_metadata,
+                )
                 contents = [
                     types.Content(
                         role="user",
-                        parts=[types.Part.from_text(text=prompt_text)],
+                        parts=[part],
                     )
                 ]
                 config = types.GenerateContentConfig(
@@ -1701,6 +1848,7 @@ class TTSBatchApp:
                             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
                         )
                     ),
+                    system_instruction="Synthesize speech for the provided text transcript verbatim. Never speak instructions, style directions, or metadata.",
                 )
 
                 pcm_chunks: list[bytes] = []
@@ -1712,14 +1860,14 @@ class TTSBatchApp:
                     if self.stop_event.is_set():
                         return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
 
-                    for part in (resp_chunk.parts or []):
-                        if part.inline_data and part.inline_data.data:
-                            raw = part.inline_data.data
+                    for p in (resp_chunk.parts or []):
+                        if p.inline_data and p.inline_data.data:
+                            raw = p.inline_data.data
                             if isinstance(raw, str):
                                 raw = base64.b64decode(raw)
                             pcm_chunks.append(raw)
-                            if part.inline_data.mime_type:
-                                detected_rate = parse_sample_rate(part.inline_data.mime_type, detected_rate)
+                            if p.inline_data.mime_type:
+                                detected_rate = parse_sample_rate(p.inline_data.mime_type, detected_rate)
 
                 full_chunk_pcm = b"".join(pcm_chunks)
                 if not full_chunk_pcm:
@@ -1911,6 +2059,13 @@ def run_selftest() -> int:
         record("Structured error classification (401 auth)", info.kind == "auth")
     except Exception as exc:
         record("Structured error classification (401 auth)", False, str(exc))
+
+    try:
+        # Verify output renaming logic
+        out_p = get_unique_output_path("test.mp3", {"test.mp3"})
+        record("Output collision avoidance logic", out_p.endswith("test1.mp3"))
+    except Exception as exc:
+        record("Output collision avoidance logic", False, str(exc))
 
     try:
         with open(log_path, "w", encoding="utf-8") as f:
