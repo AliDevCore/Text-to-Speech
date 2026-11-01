@@ -84,32 +84,20 @@ VOICES = [
     "Sulafat",
 ]
 
-# Style Presets: Persian label (escaped as \\uXXXX) -> English model instruction
+# Style Presets: English label shown in UI -> English vocal style metadata
 STYLE_PRESETS = {
-    # Without style (neutral) -> no instruction
-    "\u0628\u062f\u0648\u0646 \u0627\u0633\u062a\u0627\u06cc\u0644 (\u062e\u0646\u062b\u06cc)": "",
-    # Cheerful and energetic
-    "\u0634\u0627\u062f \u0648 \u067e\u0631\u0627\u0646\u0631\u0698\u06cc": "Say in a cheerful, upbeat and energetic tone:",
-    # Sad and depressed
-    "\u063a\u0645\u06af\u06cc\u0646 \u0648 \u0627\u0641\u0633\u0631\u062f\u0647": "Say in a sad, melancholic tone, slowly and softly:",
-    # Calm and gentle
-    "\u0622\u0631\u0627\u0645 \u0648 \u0645\u0644\u0627\u06cc\u0645": "Say in a calm, gentle and soothing tone:",
-    # Excited
-    "\u0647\u06cc\u062c\u0627\u0646\u0632\u062f\u0647": "Say in an excited and enthusiastic tone:",
-    # Serious and formal
-    "\u062c\u062f\u06cc \u0648 \u0631\u0633\u0645\u06cc": "Say in a serious, formal and professional tone:",
-    # Friendly and warm
-    "\u062f\u0648\u0633\u062a\u0627\u0646\u0647 \u0648 \u06af\u0631\u0645": "Say in a warm, friendly tone with natural micro-pauses:",
-    # Narration
-    "\u0631\u0648\u0627\u06cc\u062a\u06af\u0631": "Say in a narration style with rich vocal modulation and dramatic pauses:",
-    # News anchor
-    "\u062e\u0628\u0631\u06cc": "Say like a news anchor, clear, neutral and steady:",
-    # Whisper
-    "\u0646\u062c\u0648\u0627": "Whisper quietly:",
-    # Promotional
-    "\u062a\u0628\u0644\u06cc\u063a\u0627\u062a\u06cc": "Say in a high-energy promotional tone with elongated vowels:",
-    # Angry
-    "\u0639\u0635\u0628\u0627\u0646\u06cc": "Say in an angry, intense tone:",
+    "Neutral (No style)": "",
+    "Cheerful & Upbeat": "cheerful, upbeat and energetic tone",
+    "Sad & Melancholic": "sad, melancholic tone, slowly and softly",
+    "Calm & Soothing": "calm, gentle and soothing tone",
+    "Excited & Enthusiastic": "excited and enthusiastic tone",
+    "Serious & Formal": "serious, formal and professional tone",
+    "Warm & Friendly": "warm, friendly tone with natural micro-pauses",
+    "Narration & Storytelling": "narration style with rich vocal modulation and dramatic pauses",
+    "News Anchor": "news anchor, clear, neutral and steady",
+    "Whisper": "whisper quietly",
+    "Promotional & High-Energy": "high-energy promotional tone with elongated vowels",
+    "Angry & Intense": "angry, intense tone",
 }
 
 DEFAULT_STYLE_LABEL = list(STYLE_PRESETS.keys())[0]
@@ -568,14 +556,12 @@ def split_text_into_chunks(text: str, max_chars: int = MAX_CHARS) -> list[str]:
 # ============================================================================
 
 def resolve_style_instruction(style_value: str) -> str:
-    """Convert preset label or user free text into a model instruction string."""
+    """Convert preset label or user free text into a style description string."""
     text = (style_value or "").strip()
     if not text:
         return ""
     if text in STYLE_PRESETS:
         return STYLE_PRESETS[text]
-    if not text.endswith(":"):
-        return text + ":"
     return text
 
 
@@ -583,7 +569,7 @@ def clean_style_instruction(style_value: str) -> str:
     """Extract clean style description without imperative prefixes (e.g. 'Say in a') or trailing colons."""
     raw = resolve_style_instruction(style_value).strip()
     clean = raw.rstrip(":").strip()
-    prefixes = ("say in a ", "say in an ", "say in ", "say like a ", "say like ")
+    prefixes = ("say in a ", "say in an ", "say in ", "say like a ", "say like ", "speak in a ", "speak in ")
     lower_c = clean.lower()
     for p in prefixes:
         if lower_c.startswith(p):
@@ -1634,6 +1620,9 @@ class TTSBatchApp:
         batch_halt_reason = ""
         last_request_time = 0.0
         min_request_interval = 0.0
+        files_succeeded = 0
+        files_failed = 0
+        files_stopped = 0
 
         for file_info in prepared_files:
             item_id = file_info["item_id"]
@@ -1646,14 +1635,17 @@ class TTSBatchApp:
             base_name = os.path.basename(file_path)
 
             if self.stop_event.is_set():
+                files_stopped += 1
                 self.queue.put(("item_status", item_id, "Stopped"))
                 continue
 
             if batch_halted:
+                files_stopped += 1
                 self.queue.put(("item_status", item_id, f"Stopped: {batch_halt_reason}"))
                 continue
 
             if preload_error:
+                files_failed += 1
                 self.queue.put(("item_status", item_id, f"Error: {preload_error}"))
                 self.queue.put(("log", f"Skipping '{base_name}' due to error: {preload_error}", "err"))
                 continue
@@ -1763,6 +1755,7 @@ class TTSBatchApp:
 
             # Handle Stop / Failure / Success for this file
             if file_failed and file_err_info:
+                files_failed += 1
                 short_status = f"Error: {file_err_info.kind}"
                 self.queue.put(("item_status", item_id, short_status))
                 self.queue.put(("log", f"Failed '{base_name}': {file_err_info.user_message}", "err"))
@@ -1772,6 +1765,7 @@ class TTSBatchApp:
 
             if self.stop_event.is_set():
                 if chunks_completed_for_file < num_chunks:
+                    files_stopped += 1
                     self.queue.put(("item_status", item_id, f"Stopped ({chunks_completed_for_file}/{num_chunks} chunks)"))
                     continue
                 # If all chunks finished right as stop was clicked, still save the MP3!
@@ -1785,19 +1779,19 @@ class TTSBatchApp:
                 ))
                 save_pcm_as_mp3(bytes(pcm_accumulator), detected_sample_rate, output_mp3)
                 file_size_kb = os.path.getsize(output_mp3) / 1024.0
+                files_succeeded += 1
                 self.queue.put(("item_status", item_id, "Done"))
                 self.queue.put(("log", f"Saved MP3: '{os.path.basename(output_mp3)}' ({file_size_kb:.1f} KB).", "ok"))
 
                 # Clear this file's chunk cache on successful MP3 creation
                 shutil.rmtree(file_cache_dir, ignore_errors=True)
             except Exception as save_exc:
+                files_failed += 1
                 self.queue.put(("item_status", item_id, "Error: save failed"))
                 self.queue.put(("log", f"Failed to save MP3 for '{base_name}': {save_exc}", "err"))
 
-        if self.stop_event.is_set() or batch_halted:
-            self.queue.put(("batch_stopped", None))
-        else:
-            self.queue.put(("batch_done", None))
+        was_halted_or_stopped = self.stop_event.is_set() or batch_halted
+        self.queue.put(("batch_finished", files_succeeded, files_failed, files_stopped, was_halted_or_stopped))
 
     def _fetch_audio_chunk_with_retry(
         self,
@@ -1848,7 +1842,6 @@ class TTSBatchApp:
                             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
                         )
                     ),
-                    system_instruction="Synthesize speech for the provided text transcript verbatim. Never speak instructions, style directions, or metadata.",
                 )
 
                 pcm_chunks: list[bytes] = []
@@ -1955,20 +1948,23 @@ class TTSBatchApp:
                     self.progress_bar.configure(value=current)
                     pct = int((current / total) * 100) if total > 0 else 0
                     self.progress_label.configure(text=f"{current}/{total} chunks ({pct}%)")
+                elif msg_type == "batch_finished":
+                    succ, fail, stop_cnt, was_stopped = args[0], args[1], args[2], args[3]
+                    self._on_batch_finished(succ, fail, stop_cnt, was_stopped)
                 elif msg_type == "batch_done":
-                    self._on_batch_finished(stopped=False)
+                    self._on_batch_finished(1, 0, 0, False)
                 elif msg_type == "batch_stopped":
-                    self._on_batch_finished(stopped=True)
+                    self._on_batch_finished(0, 0, 1, True)
                 elif msg_type == "auth_error":
                     self.log(f"ERROR: {args[0]}", "err")
                     messagebox.showerror("Authentication Error", args[0])
-                    self._on_batch_finished(stopped=True)
+                    self._on_batch_finished(0, 1, 0, True)
         except queue.Empty:
             pass
         finally:
             self.root.after(100, self._process_queue)
 
-    def _on_batch_finished(self, stopped: bool):
+    def _on_batch_finished(self, succ: int, fail: int, stopped: int, was_stopped: bool):
         self.is_processing = False
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
@@ -1978,12 +1974,22 @@ class TTSBatchApp:
         self.apply_btn.configure(state="normal")
         self.apply_all_btn.configure(state="normal")
 
-        if stopped:
+        if was_stopped:
             self.progress_label.configure(text="Stopped")
-            self.log("Batch processing stopped.", "warn")
+            if fail > 0:
+                self.log(f"Batch stopped with errors: {succ} succeeded, {fail} failed, {stopped} stopped.", "err")
+            else:
+                self.log(f"Batch processing stopped. ({succ} completed)", "warn")
+        elif fail > 0:
+            if succ > 0:
+                self.progress_label.configure(text=f"Done ({fail} failed)")
+                self.log(f"Batch completed with errors: {succ} file(s) succeeded, {fail} file(s) failed.", "warn")
+            else:
+                self.progress_label.configure(text="Failed")
+                self.log(f"Batch failed: all {fail} file(s) encountered errors.", "err")
         else:
             self.progress_label.configure(text="Completed")
-            self.log("All files in batch completed successfully!", "ok")
+            self.log(f"All {succ} file(s) in batch completed successfully!", "ok")
 
     def log(self, message: str, level: str = "info"):
         """Append a message to the activity log text widget with syntax colors."""

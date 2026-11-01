@@ -316,12 +316,10 @@ class TestPromptAndStyles(unittest.TestCase):
         self.assertEqual(prompt, chunk)
 
     def test_clean_style_instruction(self):
-        cheerful_label = "\u0634\u0627\u062f \u0648 \u067e\u0631\u0627\u0646\u0631\u0698\u06cc"
-        clean = clean_style_instruction(cheerful_label)
+        clean = clean_style_instruction("Cheerful & Upbeat")
         self.assertEqual(clean, "cheerful, upbeat and energetic tone")
 
-        promo_label = "\u062a\u0628\u0644\u06cc\u063a\u0627\u062a\u06cc"
-        clean_promo = clean_style_instruction(promo_label)
+        clean_promo = clean_style_instruction("Promotional & High-Energy")
         self.assertEqual(clean_promo, "high-energy promotional tone with elongated vowels")
 
         custom_style = clean_style_instruction("Say in a whispering tone:")
