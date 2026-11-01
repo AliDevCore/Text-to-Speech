@@ -31,7 +31,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [3/4] Packaging directory build (lightweight exe with _internal folder)...
-python -m PyInstaller --onedir --windowed --name TextToSpeechBatch --collect-all google.genai --collect-all lameenc --collect-all docx --clean tts_gui.py
+python -m PyInstaller --onedir --windowed --name TextToSpeechBatch --noconfirm --collect-all google.genai --collect-all lameenc --collect-all docx --clean tts_gui.py
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] PyInstaller packaging failed.
     pause
