@@ -662,6 +662,11 @@ class TTSBatchApp:
         self.api_entry = ttk.Entry(api_card, textvariable=self.api_key_var, show="*")
         self.api_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
+        self.paste_btn = ttk.Button(
+            api_card, text="Paste", command=self._paste_api_key, style="Secondary.TButton"
+        )
+        self.paste_btn.pack(side=tk.LEFT, padx=(0, 8))
+
         self.show_key_var = tk.BooleanVar(value=False)
         self.show_check = ttk.Checkbutton(
             api_card, text="Show", variable=self.show_key_var, command=self._toggle_show_key
@@ -782,9 +787,115 @@ class TTSBatchApp:
         self.log_text.tag_configure("ok", foreground=COLOR_SUCCESS)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
+        # Attach universal clipboard handling (context menu & keycodes)
+        self._attach_universal_clipboard(self.api_entry)
+        self._attach_universal_clipboard(self.style_cb)
+
     # ------------------------------------------------------------------------
     # UI Callbacks & Handlers
     # ------------------------------------------------------------------------
+
+    def _paste_api_key(self):
+        try:
+            clip = self.root.clipboard_get().strip()
+            if clip:
+                self.api_key_var.set(clip)
+                self.log("Pasted API key from clipboard.")
+            else:
+                messagebox.showinfo("Clipboard Empty", "The clipboard does not contain any text.")
+        except Exception as exc:
+            messagebox.showinfo("Clipboard Notice", f"Unable to read clipboard: {exc}")
+
+    def _attach_universal_clipboard(self, widget: tk.Widget):
+        """Attach right-click context menu and keyboard-layout-independent shortcuts."""
+        menu = tk.Menu(
+            widget,
+            tearoff=0,
+            bg=COLOR_INPUT_BG,
+            fg=COLOR_TEXT_PRIMARY,
+            activebackground=COLOR_ACCENT_BLUE,
+            activeforeground="#ffffff",
+            bd=1,
+            relief="solid",
+        )
+
+        def do_paste():
+            try:
+                clip = self.root.clipboard_get()
+                try:
+                    widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                except tk.TclError:
+                    pass
+                widget.insert(tk.INSERT, clip)
+            except Exception:
+                pass
+
+        def do_copy():
+            try:
+                sel = widget.selection_get()
+                self.root.clipboard_clear()
+                self.root.clipboard_append(sel)
+            except Exception:
+                pass
+
+        def do_cut():
+            try:
+                sel = widget.selection_get()
+                self.root.clipboard_clear()
+                self.root.clipboard_append(sel)
+                widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            except Exception:
+                pass
+
+        def do_select_all():
+            try:
+                widget.select_range(0, tk.END)
+                widget.icursor(tk.END)
+            except Exception:
+                pass
+
+        def do_clear():
+            try:
+                widget.delete(0, tk.END)
+            except Exception:
+                pass
+
+        menu.add_command(label="Paste", command=do_paste)
+        menu.add_command(label="Copy", command=do_copy)
+        menu.add_command(label="Cut", command=do_cut)
+        menu.add_separator()
+        menu.add_command(label="Select All", command=do_select_all)
+        menu.add_command(label="Clear", command=do_clear)
+
+        def show_popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", show_popup)
+
+        def on_ctrl_key(event):
+            # event.state & 4 indicates Control key held on Windows
+            if event.state & 4:
+                # 86 = Keycode for 'V' on Windows across all keyboard layouts
+                if event.keycode == 86:
+                    do_paste()
+                    return "break"
+                # 67 = Keycode for 'C'
+                elif event.keycode == 67:
+                    do_copy()
+                    return "break"
+                # 88 = Keycode for 'X'
+                elif event.keycode == 88:
+                    do_cut()
+                    return "break"
+                # 65 = Keycode for 'A'
+                elif event.keycode == 65:
+                    do_select_all()
+                    return "break"
+
+        widget.bind("<Control-KeyPress>", on_ctrl_key)
 
     def _toggle_show_key(self):
         self.api_entry.configure(show="" if self.show_key_var.get() else "*")
