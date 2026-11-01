@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# PyInstaller
+build/
+*.manifest
+*.spec
+
+# Keep dist/ or gitignore it based on preference; ignore intermediate files
+dist/*.tmp
+dist/*.log
+
+# User and OS
+.DS_Store
+Thumbs.db
+*.code-workspace
+
