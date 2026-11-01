@@ -1,10 +1,12 @@
 """Text to Speech Batch - Windows desktop application for converting text and Word files to MP3 using Gemini TTS.
 
-All source code, identifiers, comments, and labels are written in English.
+All source code, identifiers, comments, log messages, and UI labels are written in English.
 Style preset labels in Persian are represented strictly using \\uXXXX escape sequences.
-Features direct in-place grid editing, rich real-time logging, and modern dark styling.
+Features modern dark styling, direct in-place grid editing, structured error classification,
+exact substring chunking, robust encoding/docx extraction, caching with resume, and CLI selftest.
 """
 
+from dataclasses import dataclass
 import os
 import sys
 import re
@@ -16,7 +18,9 @@ import base64
 import ctypes
 from ctypes import wintypes
 import threading
-import traceback
+import hashlib
+import shutil
+import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -43,8 +47,11 @@ MAX_CHARS = 3000
 MP3_BITRATE_KBPS = 64
 MP3_QUALITY = 2
 DEFAULT_SAMPLE_RATE = 24000
+CHUNK_GAP_SECONDS = 0.3
+CACHE_EXPIRY_DAYS = 7
+MIN_RATE_LIMIT_INTERVAL = 20.0
 
-# Color Palette (Matching Online Subtitle Generator / Modern Dark Windows)
+# Color Palette (Modern Dark Windows Studio)
 COLOR_WINDOW_BG = "#1e1e24"
 COLOR_CARD_BG = "#252836"
 COLOR_INPUT_BG = "#181a20"
@@ -218,52 +225,228 @@ def load_api_key() -> str:
 
 
 # ============================================================================
+# Error Classification
+# ============================================================================
+
+@dataclass
+class ErrorInfo:
+    kind: str  # 'auth', 'region', 'model_not_found', 'quota_daily', 'rate_limit', 'bad_request', 'transient'
+    user_message: str
+
+
+def classify_error(exc: Exception) -> ErrorInfo:
+    """Classify an API or network exception into a structured ErrorInfo."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    status = str(getattr(exc, "status", "") or "").upper()
+    raw_message = getattr(exc, "message", None) or str(exc)
+    msg_lower = (str(raw_message) + " " + str(exc)).lower()
+
+    # 1. auth: HTTP 401, or 403 with status PERMISSION_DENIED, or message containing "API key not valid" / "API_KEY_INVALID"
+    if code == 401:
+        return ErrorInfo("auth", "Invalid API key or authentication error.")
+    if code == 403 and (
+        "permission_denied" in status.lower()
+        or "permission" in msg_lower
+        or "api key not valid" in msg_lower
+        or "api_key_invalid" in msg_lower
+        or not status
+    ):
+        return ErrorInfo("auth", "Invalid API key or permission denied.")
+    if "api key not valid" in msg_lower or "api_key_invalid" in msg_lower:
+        return ErrorInfo("auth", "Invalid API key or authentication error.")
+
+    # 2. region: 400 FAILED_PRECONDITION or message containing "location is not supported"
+    if (
+        code == 400
+        and ("failed_precondition" in status.lower() or "location is not supported" in msg_lower or "user location is not supported" in msg_lower)
+    ) or "location is not supported" in msg_lower or "user location is not supported" in msg_lower:
+        return ErrorInfo(
+            "region",
+            "Gemini API reports that your location is not supported. Please check your network or proxy settings.",
+        )
+
+    # 3. model_not_found: HTTP 404
+    if code == 404:
+        return ErrorInfo("model_not_found", f"TTS model '{MODEL_NAME}' was not found (HTTP 404).")
+
+    # 4. quota_daily: 429 whose message indicates a per-day quota
+    if code == 429:
+        if any(w in msg_lower for w in ("per day", "per_day", "daily", "quota exceeded for quota metric")):
+            return ErrorInfo("quota_daily", "Daily quota exceeded for Gemini API.")
+        return ErrorInfo("rate_limit", "Rate limit reached (HTTP 429).")
+
+    # 5. bad_request: other 400 (for example an unsupported voice name)
+    if code == 400:
+        return ErrorInfo("bad_request", f"Bad request: {raw_message}")
+
+    # 6. transient: 5xx, timeouts, connection errors
+    if (
+        (code is not None and 500 <= code < 600)
+        or isinstance(exc, (TimeoutError, ConnectionError))
+        or any(w in msg_lower for w in ("timeout", "timed out", "connection", "reset", "remoteprotocolerror"))
+    ):
+        return ErrorInfo("transient", f"Transient server or network error: {raw_message}")
+
+    # Fallback client errors vs server errors
+    if code is not None and 400 <= code < 500:
+        return ErrorInfo("bad_request", f"Client error ({code}): {raw_message}")
+
+    return ErrorInfo("transient", f"Network or API error: {raw_message}")
+
+
+def extract_retry_delay(exc: Exception, attempt: int, default_sequence: list[float]) -> float:
+    """Extract server retry hint if available, otherwise return backoff step."""
+    msg = str(exc).lower()
+    match = re.search(r"retry (?:in|after) ([\d\.]+)s", msg)
+    if match:
+        try:
+            return float(match.group(1)) + 1.0
+        except ValueError:
+            pass
+    if attempt < len(default_sequence):
+        return default_sequence[attempt]
+    return default_sequence[-1]
+
+
+# ============================================================================
+# Cache Management
+# ============================================================================
+
+def get_cache_root_dir() -> str:
+    """Return root directory for cached audio chunks in %TEMP%\\TextToSpeechBatch\\cache."""
+    root = os.path.join(tempfile.gettempdir(), "TextToSpeechBatch", "cache")
+    try:
+        os.makedirs(root, exist_ok=True)
+    except Exception:
+        pass
+    return root
+
+
+def get_file_cache_dir(file_path: str, voice: str, resolved_style: str) -> str:
+    """Compute deterministic cache directory for a file based on path, voice, style, and model."""
+    key = f"{os.path.abspath(file_path)}|{voice}|{resolved_style}|{MODEL_NAME}"
+    hash_str = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    file_cache_dir = os.path.join(get_cache_root_dir(), hash_str)
+    try:
+        os.makedirs(file_cache_dir, exist_ok=True)
+    except Exception:
+        pass
+    return file_cache_dir
+
+
+def cleanup_old_caches(max_age_days: int = CACHE_EXPIRY_DAYS):
+    """Purge cached directories older than max_age_days at application startup."""
+    root = get_cache_root_dir()
+    if not os.path.isdir(root):
+        return
+    now = time.time()
+    cutoff_seconds = max_age_days * 86400
+    try:
+        for entry in os.scandir(root):
+            if entry.is_dir():
+                try:
+                    mtime = entry.stat().st_mtime
+                    if now - mtime > cutoff_seconds:
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+# ============================================================================
 # Document Extraction & Chunking
 # ============================================================================
 
 def extract_text_from_txt(file_path: str) -> str:
-    """Extract text from a .txt file trying encodings: utf-8-sig, utf-8, utf-16, cp1256."""
-    encodings = ["utf-8-sig", "utf-8", "utf-16", "cp1256"]
+    """Extract text from a .txt file strictly respecting BOM, strict UTF-8, and strict CP1256."""
     with open(file_path, "rb") as f:
         raw_bytes = f.read()
 
-    for enc in encodings:
-        try:
-            text = raw_bytes.decode(enc)
-            if text.strip():
-                return text
+    # 1. BOM detection (never fall back to ungrounded UTF-16)
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        text = raw_bytes.decode("utf-8-sig")
+        if not text.strip():
             raise ValueError("no text found")
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("Could not decode text file with supported encodings")
+        return text
+    if raw_bytes.startswith(b"\xff\xfe") or raw_bytes.startswith(b"\xfe\xff"):
+        text = raw_bytes.decode("utf-16")
+        if not text.strip():
+            raise ValueError("no text found")
+        return text
+
+    # 2. Strict UTF-8 without BOM
+    try:
+        text = raw_bytes.decode("utf-8")
+        if text.strip():
+            return text
+        raise ValueError("no text found")
+    except UnicodeDecodeError:
+        pass
+
+    # 3. Strict CP1256 without BOM (never try UTF-16 without BOM)
+    try:
+        text = raw_bytes.decode("cp1256")
+        if text.strip():
+            return text
+        raise ValueError("no text found")
+    except UnicodeDecodeError:
+        pass
+
+    # 4. Fallback UTF-8 with error replacement
+    text = raw_bytes.decode("utf-8", errors="replace")
+    if text.strip():
+        return text
+    raise ValueError("no text found")
+
+
+def _extract_blocks_from_element(elem, doc: docx.Document) -> list[str]:
+    """Recursively extract paragraphs, deduplicated tables, and SDT content controls."""
+    blocks: list[str] = []
+    for child in elem:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "p":
+            p = Paragraph(child, doc)
+            txt = p.text.strip()
+            if txt:
+                blocks.append(txt)
+        elif tag == "tbl":
+            tbl = Table(child, doc)
+            table_rows = []
+            seen_tcs = set()
+            for row in tbl.rows:
+                row_cells = []
+                for cell in row.cells:
+                    if cell._tc in seen_tcs:
+                        continue
+                    seen_tcs.add(cell._tc)
+                    c_txt = cell.text.strip()
+                    if c_txt:
+                        row_cells.append(c_txt)
+                if row_cells:
+                    table_rows.append(" ".join(row_cells))
+            if table_rows:
+                blocks.append("\n".join(table_rows))
+        elif tag == "sdt":
+            content_elem = None
+            for c in child:
+                if c.tag.endswith("sdtContent"):
+                    content_elem = c
+                    break
+            if content_elem is not None:
+                sub_blocks = _extract_blocks_from_element(content_elem, doc)
+                blocks.extend(sub_blocks)
+    return blocks
 
 
 def extract_text_from_docx(file_path: str) -> str:
-    """Extract text from a .docx file reading paragraphs and table cells in body order."""
+    """Extract text from a .docx file in natural document order with merged cell deduplication."""
     try:
         doc = docx.Document(file_path)
     except Exception as exc:
         raise ValueError(f"Failed to read Word document: {exc}")
 
-    body_blocks = []
-    for child in doc.element.body:
-        tag = child.tag
-        if tag.endswith("p"):
-            p = Paragraph(child, doc)
-            text = p.text.strip()
-            if text:
-                body_blocks.append(text)
-        elif tag.endswith("tbl"):
-            tbl = Table(child, doc)
-            table_rows = []
-            for row in tbl.rows:
-                row_cells = [cell.text.strip() for cell in row.cells]
-                row_text = " ".join(row_cells).strip()
-                if row_text:
-                    table_rows.append(row_text)
-            if table_rows:
-                body_blocks.append("\n".join(table_rows))
-
+    body_blocks = _extract_blocks_from_element(doc.element.body, doc)
     full_text = "\n\n".join(body_blocks).strip()
     if not full_text:
         raise ValueError("no text found")
@@ -271,7 +454,7 @@ def extract_text_from_docx(file_path: str) -> str:
 
 
 def extract_text(file_path: str) -> str:
-    """Extract text from .txt or .docx file and reject empty content."""
+    """Extract text from .txt or .docx file and reject empty content or legacy .doc."""
     lower_path = file_path.lower()
     if lower_path.endswith(".txt"):
         return extract_text_from_txt(file_path)
@@ -283,53 +466,63 @@ def extract_text(file_path: str) -> str:
 
 
 def split_text_into_chunks(text: str, max_chars: int = MAX_CHARS) -> list[str]:
-    """Split text into chunks of at most max_chars."""
+    """Split text into chunks of at most max_chars without altering text or punctuation."""
     clean_text = text.strip()
     if not clean_text:
         return []
 
-    raw_paras = re.split(r"\n\s*\n+", clean_text)
-    sentence_pattern = r"(?<=[.!?:\n\u061f\u061b])+(?![.!?:\n\u061f\u061b])\s*"
+    # Split boundaries: paragraph breaks, line breaks, or sentence enders followed by whitespace
+    split_pattern = r"(\r?\n\s*\r?\n+|\r?\n|(?<=[.!?:\u061f\u061b])\s+)"
+    parts = re.split(split_pattern, clean_text)
 
-    atomic_pieces: list[tuple[str, bool]] = []
+    tokens: list[tuple[str, str]] = []
+    i = 0
+    while i < len(parts):
+        piece = parts[i]
+        sep = parts[i + 1] if i + 1 < len(parts) else ""
+        i += 2
 
-    for para in raw_paras:
-        para_trimmed = para.strip()
-        if not para_trimmed:
+        if not piece and not sep:
             continue
 
-        raw_sentences = [s.strip() for s in re.split(sentence_pattern, para_trimmed) if s.strip()]
-        if not raw_sentences:
-            continue
-
-        first_piece_in_para = True
-        for sent in raw_sentences:
-            if len(sent) > max_chars:
-                for i in range(0, len(sent), max_chars):
-                    sub = sent[i:i + max_chars]
-                    atomic_pieces.append((sub, first_piece_in_para))
-                    first_piece_in_para = False
-            else:
-                atomic_pieces.append((sent, first_piece_in_para))
-                first_piece_in_para = False
-
-    if not atomic_pieces:
-        return []
+        if len(piece) > max_chars:
+            start = 0
+            while start < len(piece):
+                remaining = piece[start:]
+                if len(remaining) <= max_chars:
+                    tokens.append((remaining, sep))
+                    break
+                sub = remaining[:max_chars]
+                last_space = max(sub.rfind(" "), sub.rfind("\t"))
+                if last_space > 0:
+                    tokens.append((remaining[:last_space], remaining[last_space:last_space + 1]))
+                    start += last_space + 1
+                else:
+                    tokens.append((sub, ""))
+                    start += max_chars
+        else:
+            tokens.append((piece, sep))
 
     chunks: list[str] = []
     current_chunk = ""
+    pending_sep = ""
 
-    for piece, is_new_para in atomic_pieces:
+    for piece, sep in tokens:
+        if not piece:
+            pending_sep += sep
+            continue
         if not current_chunk:
             current_chunk = piece
+            pending_sep = sep
             continue
 
-        sep = "\n\n" if is_new_para else " "
-        if len(current_chunk) + len(sep) + len(piece) <= max_chars:
-            current_chunk += sep + piece
+        if len(current_chunk) + len(pending_sep) + len(piece) <= max_chars:
+            current_chunk += pending_sep + piece
+            pending_sep = sep
         else:
             chunks.append(current_chunk)
             current_chunk = piece
+            pending_sep = sep
 
     if current_chunk:
         chunks.append(current_chunk)
@@ -415,30 +608,8 @@ def check_output_collisions(file_paths: list[str]) -> dict[str, list[str]]:
     return {out_path: files for out_path, files in dest_map.items() if len(files) > 1}
 
 
-def is_auth_or_invalid_key_error(exc: Exception) -> bool:
-    """Check if an exception represents an invalid API key or auth failure (HTTP 400/401/403)."""
-    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    if code in (400, 401, 403):
-        return True
-    msg = str(exc).lower()
-    if any(k in msg for k in ("401", "403", "api key not valid", "permission denied", "invalid api key", "unauthenticated")):
-        return True
-    if "400" in msg and ("key" in msg or "invalid" in msg or "api_key" in msg):
-        return True
-    return False
-
-
-def is_rate_limit_error(exc: Exception) -> bool:
-    """Check if an exception represents rate limiting (HTTP 429)."""
-    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    if code == 429:
-        return True
-    msg = str(exc).lower()
-    return "429" in msg or "resource_exhausted" in msg or "quota" in msg
-
-
 # ============================================================================
-# Main Application GUI (Modern Dark Theme with In-Place Grid Editing)
+# Main Application GUI
 # ============================================================================
 
 class TTSBatchApp:
@@ -456,6 +627,10 @@ class TTSBatchApp:
         self.stop_event = threading.Event()
         self.queue: queue.Queue = queue.Queue()
         self.active_cell_editor: ttk.Combobox | None = None
+        self._is_programmatic_update = False
+
+        # Clean old caches from past sessions (> 7 days)
+        cleanup_old_caches(CACHE_EXPIRY_DAYS)
 
         # Apply Modern Dark Stylesheet
         self._setup_dark_theme()
@@ -745,6 +920,7 @@ class TTSBatchApp:
             settings_card, textvariable=self.voice_var, values=VOICES, state="readonly", width=16
         )
         self.voice_cb.grid(row=0, column=1, padx=(0, 16), sticky=tk.W)
+        self.voice_cb.bind("<<ComboboxSelected>>", self._on_panel_voice_change)
 
         ttk.Label(settings_card, text="Style:", style="Card.TLabel").grid(row=0, column=2, padx=(0, 6), sticky=tk.W)
         self.style_var = tk.StringVar(value=self.last_applied_style)
@@ -752,6 +928,9 @@ class TTSBatchApp:
             settings_card, textvariable=self.style_var, values=list(STYLE_PRESETS.keys()), state="normal", width=28
         )
         self.style_cb.grid(row=0, column=3, padx=(0, 16), sticky=tk.W)
+        self.style_cb.bind("<<ComboboxSelected>>", self._on_panel_style_change)
+        self.style_cb.bind("<Return>", self._on_panel_style_change)
+        self.style_cb.bind("<FocusOut>", self._on_panel_style_focus_out)
 
         self.apply_btn = ttk.Button(settings_card, text="Apply to Selected", command=self._apply_settings, style="Secondary.TButton")
         self.apply_btn.grid(row=0, column=4, padx=(0, 6))
@@ -827,7 +1006,6 @@ class TTSBatchApp:
             return
 
         if column in ("#2", "#3"):
-            # Delay slightly to allow selection to update
             self.root.after(20, lambda: self._open_cell_editor(row_id, column))
 
     def _open_cell_editor(self, row_id: str, column: str):
@@ -867,14 +1045,18 @@ class TTSBatchApp:
             if new_val:
                 self.tree.set(row_id, col_name, new_val)
                 file_name = os.path.basename(self.tree.set(row_id, "filepath"))
-                if col_name == "voice":
-                    self.last_applied_voice = new_val
-                    self.voice_var.set(new_val)
-                    self.log(f"Grid edit: Set Voice of '{file_name}' to '{new_val}'.", "info")
-                elif col_name == "style":
-                    self.last_applied_style = new_val
-                    self.style_var.set(new_val)
-                    self.log(f"Grid edit: Set Style of '{file_name}' to '{new_val}'.", "info")
+                self._is_programmatic_update = True
+                try:
+                    if col_name == "voice":
+                        self.last_applied_voice = new_val
+                        self.voice_var.set(new_val)
+                        self.log(f"Grid edit: Set Voice of '{file_name}' to '{new_val}'.", "info")
+                    elif col_name == "style":
+                        self.last_applied_style = new_val
+                        self.style_var.set(new_val)
+                        self.log(f"Grid edit: Set Style of '{file_name}' to '{new_val}'.", "info")
+                finally:
+                    self._is_programmatic_update = False
             cb.destroy()
             self.active_cell_editor = None
 
@@ -899,6 +1081,45 @@ class TTSBatchApp:
             self.root.after(120, check)
 
         cb.bind("<FocusOut>", on_focus_out)
+
+    # ------------------------------------------------------------------------
+    # Panel Auto-Apply Handlers
+    # ------------------------------------------------------------------------
+
+    def _on_panel_voice_change(self, event=None):
+        if self._is_programmatic_update or self.is_processing:
+            return
+        selected = self.tree.selection()
+        new_val = self.voice_var.get().strip() or VOICES[0]
+        self.last_applied_voice = new_val
+        if selected:
+            for item in selected:
+                self.tree.set(item, "voice", new_val)
+            self.log(f"Auto-applied Voice '{new_val}' to {len(selected)} selected file(s).", "info")
+
+    def _on_panel_style_change(self, event=None):
+        if self._is_programmatic_update or self.is_processing:
+            return
+        selected = self.tree.selection()
+        new_val = self.style_var.get().strip() or DEFAULT_STYLE_LABEL
+        self.last_applied_style = new_val
+        if selected:
+            for item in selected:
+                self.tree.set(item, "style", new_val)
+            self.log(f"Auto-applied Style '{new_val}' to {len(selected)} selected file(s).", "info")
+
+    def _on_panel_style_focus_out(self, event=None):
+        if self._is_programmatic_update or self.is_processing:
+            return
+        def check():
+            try:
+                fw = self.root.focus_get()
+                if fw and ("combobox" in str(fw).lower() or "listbox" in str(fw).lower()):
+                    return
+                self._on_panel_style_change()
+            except Exception:
+                pass
+        self.root.after(120, check)
 
     # ------------------------------------------------------------------------
     # Clipboard & UI Handlers
@@ -1011,10 +1232,16 @@ class TTSBatchApp:
             first_item = selected[0]
             voice_val = self.tree.set(first_item, "voice")
             style_val = self.tree.set(first_item, "style")
-            if voice_val:
-                self.voice_var.set(voice_val)
-            if style_val:
-                self.style_var.set(style_val)
+            self._is_programmatic_update = True
+            try:
+                if voice_val:
+                    self.voice_var.set(voice_val)
+                    self.last_applied_voice = voice_val
+                if style_val:
+                    self.style_var.set(style_val)
+                    self.last_applied_style = style_val
+            finally:
+                self._is_programmatic_update = False
 
     def _add_files(self):
         file_paths = filedialog.askopenfilenames(
@@ -1035,6 +1262,8 @@ class TTSBatchApp:
         }
 
         added_count = 0
+        skipped_unsupported: list[str] = []
+
         for path in file_paths:
             abs_path = os.path.abspath(path)
             base_name = os.path.basename(abs_path)
@@ -1042,12 +1271,9 @@ class TTSBatchApp:
             if base_name.startswith("~$"):
                 continue
 
-            if abs_path.lower().endswith(".doc"):
-                messagebox.showwarning(
-                    "Unsupported Format",
-                    f"Legacy .doc format is not supported for:\n{base_name}\n\n"
-                    "Please open this document in Microsoft Word and save it as .docx format.",
-                )
+            lower_ext = os.path.splitext(abs_path)[1].lower()
+            if lower_ext not in (".txt", ".docx"):
+                skipped_unsupported.append(base_name)
                 continue
 
             norm_path = os.path.normcase(abs_path)
@@ -1064,6 +1290,17 @@ class TTSBatchApp:
 
         if added_count > 0:
             self.log(f"Added {added_count} file(s) to conversion queue.", "info")
+
+        if skipped_unsupported:
+            display_list = skipped_unsupported[:10]
+            extra = f"\n...and {len(skipped_unsupported) - 10} more." if len(skipped_unsupported) > 10 else ""
+            msg = (
+                f"Skipped {len(skipped_unsupported)} unsupported file(s). "
+                "Only .txt and .docx formats are supported:\n\n"
+                + "\n".join(display_list)
+                + extra
+            )
+            messagebox.showwarning("Unsupported Files Skipped", msg)
 
     def _remove_selected(self):
         if self.is_processing:
@@ -1190,23 +1427,27 @@ class TTSBatchApp:
             return
         self.stop_event.set()
         self.stop_btn.configure(state="disabled")
-        self.log("Stop requested by user. Waiting for current chunk to finish...", "warn")
+        self.log("Stop requested by user. Halting gracefully...", "warn")
         self.progress_label.configure(text="Stopping...")
 
     def _worker_thread(self, file_records: list[tuple[str, str, str, str]], api_key: str):
-        """Sequential background processing worker for files and chunks with rich logging."""
+        """Sequential background processing worker with caching, rate limiting, and structured error control."""
         is_mock = os.environ.get("TTS_MOCK") == "1"
         client = None
 
         if is_mock:
-            self.queue.put(("log", "[MOCK MODE] Network calls bypassed. Generating 1s silence per chunk.", "warn"))
+            self.queue.put(("log", "[MOCK MODE] Network calls bypassed. Generating silence per chunk.", "warn"))
         else:
             self.queue.put(("log", "Connecting to Gemini API...", "info"))
             try:
-                client = genai.Client(api_key=api_key)
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=types.HttpOptions(timeout=180000),
+                )
                 self.queue.put(("log", f"Connected to Gemini API using model '{MODEL_NAME}'.", "ok"))
             except Exception as exc:
-                self.queue.put(("auth_error", f"Failed to connect to Gemini API: {exc}"))
+                err_info = classify_error(exc)
+                self.queue.put(("auth_error", f"Failed to initialize Gemini API client: {err_info.user_message}"))
                 return
 
         # Pre-extract, inspect and chunk all files
@@ -1257,7 +1498,10 @@ class TTSBatchApp:
         self.queue.put(("log", f"Total chunks across batch: {total_chunks}.", "info"))
 
         completed_chunks = 0
-        auth_failed = False
+        batch_halted = False
+        batch_halt_reason = ""
+        last_request_time = 0.0
+        min_request_interval = 0.0
 
         for file_info in prepared_files:
             item_id = file_info["item_id"]
@@ -1272,8 +1516,8 @@ class TTSBatchApp:
                 self.queue.put(("item_status", item_id, "Stopped"))
                 continue
 
-            if auth_failed:
-                self.queue.put(("item_status", item_id, "Stopped"))
+            if batch_halted:
+                self.queue.put(("item_status", item_id, f"Stopped: {batch_halt_reason}"))
                 continue
 
             if preload_error:
@@ -1286,69 +1530,119 @@ class TTSBatchApp:
             detected_sample_rate = DEFAULT_SAMPLE_RATE
             num_chunks = len(chunks)
             file_failed = False
-            file_err_msg = ""
+            file_err_info: ErrorInfo | None = None
+            resolved_style = resolve_style_instruction(style)
+            file_cache_dir = get_file_cache_dir(file_path, voice, resolved_style)
 
             self.queue.put(("log", f"Processing '{base_name}' ({num_chunks} chunks, Voice: '{voice}', Style: '{style}')...", "info"))
+            chunks_completed_for_file = 0
 
             for idx, chunk in enumerate(chunks, start=1):
                 if self.stop_event.is_set():
-                    self.queue.put(("item_status", item_id, "Stopped"))
-                    self.queue.put(("log", f"Stopped while processing '{base_name}'.", "warn"))
+                    self.queue.put(("item_status", item_id, f"Stopped ({chunks_completed_for_file}/{num_chunks} chunks)"))
+                    self.queue.put(("log", f"Stopped while processing '{base_name}' ({chunks_completed_for_file}/{num_chunks} chunks completed).", "warn"))
                     break
 
                 self.queue.put(("item_status", item_id, f"Processing (chunk {idx}/{num_chunks})"))
 
-                style_instruction = resolve_style_instruction(style)
-                prompt_text = build_prompt(style_instruction, chunk)
+                prompt_text = build_prompt(resolved_style, chunk)
+                cache_file = os.path.join(file_cache_dir, f"{idx}.pcm")
 
-                self.queue.put(("log", f"Sending chunk {idx}/{num_chunks} ({len(chunk):,} chars) to Gemini TTS...", "info"))
-                if style_instruction:
-                    self.queue.put(("log", f"  Instruction: \"{style_instruction}\"", "sub"))
+                # Check if this chunk is already cached from an earlier stopped run
+                if os.path.isfile(cache_file) and os.path.getsize(cache_file) > 0:
+                    try:
+                        with open(cache_file, "rb") as cf:
+                            chunk_pcm = cf.read()
+                        chunk_rate = DEFAULT_SAMPLE_RATE
+                        err_info = None
+                        self.queue.put(("log", f"  Chunk {idx}/{num_chunks} loaded from local cache (resumed).", "ok"))
+                    except Exception:
+                        chunk_pcm = b""
+                        chunk_rate = DEFAULT_SAMPLE_RATE
+                        err_info = None
+                else:
+                    chunk_pcm = b""
 
-                chunk_pcm, chunk_rate, err = self._fetch_audio_chunk_with_retry(
-                    client=client,
-                    prompt_text=prompt_text,
-                    voice=voice,
-                    is_mock=is_mock,
-                    chunk_idx=idx,
-                    total_chunks=num_chunks,
-                )
+                if not chunk_pcm:
+                    # Enforce inter-request rate limit spacing if a 429 was seen
+                    if min_request_interval > 0.0 and not is_mock:
+                        elapsed = time.time() - last_request_time
+                        if elapsed < min_request_interval:
+                            wait_gap = min_request_interval - elapsed
+                            gap_slept = 0.0
+                            while gap_slept < wait_gap:
+                                if self.stop_event.is_set():
+                                    break
+                                step = min(0.2, wait_gap - gap_slept)
+                                time.sleep(step)
+                                gap_slept += step
 
-                if err:
-                    file_failed = True
-                    file_err_msg = err
-                    if is_auth_or_invalid_key_error(Exception(err)):
-                        auth_failed = True
-                    break
+                    if self.stop_event.is_set():
+                        self.queue.put(("item_status", item_id, f"Stopped ({chunks_completed_for_file}/{num_chunks} chunks)"))
+                        break
+
+                    self.queue.put(("log", f"Sending chunk {idx}/{num_chunks} ({len(chunk):,} chars) to Gemini TTS...", "info"))
+                    if resolved_style:
+                        self.queue.put(("log", f"  Instruction: \"{resolved_style}\"", "sub"))
+
+                    last_request_time = time.time()
+                    chunk_pcm, chunk_rate, err_info, was_rate_limited = self._fetch_audio_chunk_with_retry(
+                        client=client,
+                        prompt_text=prompt_text,
+                        voice=voice,
+                        is_mock=is_mock,
+                        chunk_idx=idx,
+                        total_chunks=num_chunks,
+                    )
+
+                    if was_rate_limited:
+                        min_request_interval = MIN_RATE_LIMIT_INTERVAL
+
+                    if err_info:
+                        file_failed = True
+                        file_err_info = err_info
+                        # Check halting kinds: auth, region, model_not_found, quota_daily
+                        if err_info.kind in ("auth", "region", "model_not_found", "quota_daily"):
+                            batch_halted = True
+                            batch_halt_reason = err_info.kind
+                        break
+
+                    # Save chunk to cache
+                    try:
+                        with open(cache_file, "wb") as cf:
+                            cf.write(chunk_pcm)
+                    except Exception:
+                        pass
+
+                # Add 0.3s silence gap between chunks of the same file
+                if pcm_accumulator:
+                    gap_silence = b"\x00" * int(chunk_rate * 2 * CHUNK_GAP_SECONDS)
+                    pcm_accumulator.extend(gap_silence)
 
                 pcm_accumulator.extend(chunk_pcm)
                 if chunk_rate:
                     detected_sample_rate = chunk_rate
 
-                self.queue.put((
-                    "log",
-                    f"  Received chunk {idx}/{num_chunks} audio: {len(chunk_pcm):,} bytes PCM ({chunk_rate} Hz).",
-                    "sub",
-                ))
-
+                chunks_completed_for_file += 1
                 completed_chunks += 1
                 self.queue.put(("progress_update", completed_chunks, total_chunks))
 
+            # Handle Stop / Failure / Success for this file
+            if file_failed and file_err_info:
+                short_status = f"Error: {file_err_info.kind}"
+                self.queue.put(("item_status", item_id, short_status))
+                self.queue.put(("log", f"Failed '{base_name}': {file_err_info.user_message}", "err"))
+                if batch_halted:
+                    self.queue.put(("log", f"Critical error ({file_err_info.kind}). Halting remaining queue.", "err"))
+                continue
+
             if self.stop_event.is_set():
-                self.queue.put(("item_status", item_id, "Stopped"))
-                continue
+                if chunks_completed_for_file < num_chunks:
+                    self.queue.put(("item_status", item_id, f"Stopped ({chunks_completed_for_file}/{num_chunks} chunks)"))
+                    continue
+                # If all chunks finished right as stop was clicked, still save the MP3!
 
-            if file_failed:
-                short_reason = file_err_msg.splitlines()[0]
-                if len(short_reason) > 35:
-                    short_reason = short_reason[:32] + "..."
-                self.queue.put(("item_status", item_id, f"Error: {short_reason}"))
-                self.queue.put(("log", f"Failed '{base_name}': {file_err_msg}", "err"))
-                if auth_failed:
-                    self.queue.put(("log", "Authentication failure detected. Halting remaining queue.", "err"))
-                continue
-
-            # Encode all accumulated PCM chunks to MP3
+            # All chunks for this file succeeded -> encode to MP3
             try:
                 self.queue.put((
                     "log",
@@ -1359,29 +1653,38 @@ class TTSBatchApp:
                 file_size_kb = os.path.getsize(output_mp3) / 1024.0
                 self.queue.put(("item_status", item_id, "Done"))
                 self.queue.put(("log", f"Saved MP3: '{os.path.basename(output_mp3)}' ({file_size_kb:.1f} KB).", "ok"))
+
+                # Clear this file's chunk cache on successful MP3 creation
+                shutil.rmtree(file_cache_dir, ignore_errors=True)
             except Exception as save_exc:
                 self.queue.put(("item_status", item_id, "Error: save failed"))
                 self.queue.put(("log", f"Failed to save MP3 for '{base_name}': {save_exc}", "err"))
 
-        if self.stop_event.is_set():
+        if self.stop_event.is_set() or batch_halted:
             self.queue.put(("batch_stopped", None))
         else:
             self.queue.put(("batch_done", None))
 
     def _fetch_audio_chunk_with_retry(
         self, client: genai.Client | None, prompt_text: str, voice: str, is_mock: bool, chunk_idx: int, total_chunks: int
-    ) -> tuple[bytes, int, str | None]:
-        """Fetch TTS audio for a single chunk with retry backoff (2s, 4s)."""
+    ) -> tuple[bytes, int, ErrorInfo | None, bool]:
+        """Fetch TTS audio for a single chunk with structured error classification and retry handling."""
         if is_mock:
             time.sleep(0.08)
-            return b"\x00" * (DEFAULT_SAMPLE_RATE * 2), DEFAULT_SAMPLE_RATE, None
+            return b"\x00" * (DEFAULT_SAMPLE_RATE * 2), DEFAULT_SAMPLE_RATE, None, False
 
-        max_retries = 3
-        backoff_delays = [2.0, 4.0]
+        rate_limit_sequence = [20.0, 40.0, 60.0, 60.0]
+        transient_sequence = [2.0, 4.0]
+        max_rate_limit_attempts = 5
+        max_transient_attempts = 3
 
-        for attempt in range(max_retries):
+        rate_limit_attempt = 0
+        transient_attempt = 0
+        saw_rate_limit = False
+
+        while True:
             if self.stop_event.is_set():
-                return b"", DEFAULT_SAMPLE_RATE, "Operation stopped by user"
+                return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
 
             try:
                 contents = [
@@ -1407,7 +1710,7 @@ class TTSBatchApp:
                     model=MODEL_NAME, contents=contents, config=config
                 ):
                     if self.stop_event.is_set():
-                        return b"", DEFAULT_SAMPLE_RATE, "Operation stopped by user"
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
 
                     for part in (resp_chunk.parts or []):
                         if part.inline_data and part.inline_data.data:
@@ -1421,33 +1724,61 @@ class TTSBatchApp:
                 full_chunk_pcm = b"".join(pcm_chunks)
                 if not full_chunk_pcm:
                     raise RuntimeError("No audio data received from Gemini TTS API")
-                return full_chunk_pcm, detected_rate, None
+                return full_chunk_pcm, detected_rate, None, saw_rate_limit
 
             except Exception as exc:
                 if self.stop_event.is_set():
-                    return b"", DEFAULT_SAMPLE_RATE, "Operation stopped by user"
+                    return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
 
-                if is_auth_or_invalid_key_error(exc):
-                    return b"", DEFAULT_SAMPLE_RATE, f"Invalid API Key or Permission Error: {exc}"
+                err_info = classify_error(exc)
 
-                if attempt == max_retries - 1:
-                    return b"", DEFAULT_SAMPLE_RATE, f"Failed after {max_retries} attempts: {exc}"
+                # Halt immediately on auth, region, model_not_found, or daily quota
+                if err_info.kind in ("auth", "region", "model_not_found", "quota_daily"):
+                    return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit
 
-                if is_rate_limit_error(exc):
-                    delay = 7.0 * (attempt + 1)
-                    self.queue.put(("log", f"Rate limit reached (429) on chunk {chunk_idx}. Waiting {delay:.0f}s before retry...", "warn"))
-                else:
-                    delay = backoff_delays[attempt]
-                    self.queue.put(("log", f"API warning on chunk {chunk_idx}: {exc}. Retrying in {delay:.0f}s (attempt {attempt + 2}/{max_retries})...", "warn"))
+                # Fail-fast without retry on client 400 bad_request (e.g. invalid voice name)
+                if err_info.kind == "bad_request":
+                    return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit
 
-                sleep_passed = 0.0
-                while sleep_passed < delay:
-                    if self.stop_event.is_set():
-                        return b"", DEFAULT_SAMPLE_RATE, "Operation stopped by user"
-                    time.sleep(min(0.2, delay - sleep_passed))
-                    sleep_passed += 0.2
+                # Handle 429 rate_limit
+                if err_info.kind == "rate_limit":
+                    saw_rate_limit = True
+                    rate_limit_attempt += 1
+                    if rate_limit_attempt >= max_rate_limit_attempts:
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("rate_limit", f"Rate limit exceeded after {max_rate_limit_attempts} attempts: {exc}"), True
 
-        return b"", DEFAULT_SAMPLE_RATE, "Max retries exceeded"
+                    delay = extract_retry_delay(exc, rate_limit_attempt - 1, rate_limit_sequence)
+                    self.queue.put(("log", f"Rate limit (429) on chunk {chunk_idx}/{total_chunks}. Waiting {delay:.0f}s before retry (attempt {rate_limit_attempt + 1}/{max_rate_limit_attempts})...", "warn"))
+
+                    slept = 0.0
+                    while slept < delay:
+                        if self.stop_event.is_set():
+                            return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), True
+                        step = min(0.2, delay - slept)
+                        time.sleep(step)
+                        slept += step
+                    continue
+
+                # Handle transient 5xx or connection errors
+                if err_info.kind == "transient":
+                    transient_attempt += 1
+                    if transient_attempt >= max_transient_attempts:
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("transient", f"Transient error failed after {max_transient_attempts} attempts: {exc}"), saw_rate_limit
+
+                    delay = transient_sequence[min(transient_attempt - 1, len(transient_sequence) - 1)]
+                    self.queue.put(("log", f"Transient error on chunk {chunk_idx}: {exc}. Retrying in {delay:.0f}s (attempt {transient_attempt + 1}/{max_transient_attempts})...", "warn"))
+
+                    slept = 0.0
+                    while slept < delay:
+                        if self.stop_event.is_set():
+                            return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
+                        step = min(0.2, delay - slept)
+                        time.sleep(step)
+                        slept += step
+                    continue
+
+                # Any unclassified error: abort current file
+                return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit
 
     # ------------------------------------------------------------------------
     # Queue Processing & UI Dispatching
@@ -1461,8 +1792,8 @@ class TTSBatchApp:
                 args = msg[1:]
                 if msg_type == "log":
                     text = args[0]
-                    tag = args[1] if len(args) > 1 else None
-                    self.log(text, tag)
+                    level = args[1] if len(args) > 1 else "info"
+                    self.log(text, level)
                 elif msg_type == "item_status":
                     item_id, status_val = args[0], args[1]
                     if self.tree.exists(item_id):
@@ -1506,24 +1837,15 @@ class TTSBatchApp:
             self.progress_label.configure(text="Completed")
             self.log("All files in batch completed successfully!", "ok")
 
-    def log(self, message: str, tag: str | None = None):
-        """Append a message to the activity log text widget with rich syntax colors."""
+    def log(self, message: str, level: str = "info"):
+        """Append a message to the activity log text widget with syntax colors."""
         timestamp = time.strftime("[%H:%M:%S] ")
         self.log_text.configure(state="normal")
         self.log_text.insert(tk.END, timestamp, "time")
 
-        if tag is None:
-            msg_lower = message.lower()
-            if "error" in msg_lower or "failed" in msg_lower:
-                tag = "err"
-            elif "success" in msg_lower or "finished" in msg_lower or "completed" in msg_lower or "connected to" in msg_lower or "saved mp3" in msg_lower:
-                tag = "ok"
-            elif "warning" in msg_lower or "retry" in msg_lower or "warn" in msg_lower:
-                tag = "warn"
-            elif message.startswith("  "):
-                tag = "sub"
-            else:
-                tag = "info"
+        tag = level
+        if tag not in ("info", "ok", "err", "warn", "sub"):
+            tag = "info"
 
         self.log_text.insert(tk.END, message + "\n", tag)
         self.log_text.see(tk.END)
@@ -1537,10 +1859,79 @@ class TTSBatchApp:
 
 
 # ============================================================================
+# Self-Test Mode (--selftest CLI)
+# ============================================================================
+
+def run_selftest() -> int:
+    """Run an automated self-test verifying DPAPI, audio encoder, chunking, and error classifier."""
+    log_path = os.path.join(tempfile.gettempdir(), "tts_selftest.log")
+    messages = []
+    success = True
+
+    def record(title: str, passed: bool, detail: str = ""):
+        nonlocal success
+        status_tag = "[PASS]" if passed else "[FAIL]"
+        line = f"{status_tag} {title}" + (f": {detail}" if detail else "")
+        messages.append(line)
+        if not passed:
+            success = False
+
+    try:
+        test_plain = b"TextToSpeechBatch_DPAPI_SelfTest_Payload"
+        enc = protect_data(test_plain)
+        dec = unprotect_data(enc)
+        record("DPAPI protect & unprotect", dec == test_plain)
+    except Exception as exc:
+        record("DPAPI protect & unprotect", False, str(exc))
+
+    try:
+        encoder = lameenc.Encoder()
+        encoder.set_bit_rate(MP3_BITRATE_KBPS)
+        encoder.set_in_sample_rate(DEFAULT_SAMPLE_RATE)
+        encoder.set_channels(1)
+        encoder.set_out_sample_rate(DEFAULT_SAMPLE_RATE)
+        encoder.set_quality(MP3_QUALITY)
+        test_pcm = b"\x00" * 4800  # 0.1s silence
+        mp3_out = encoder.encode(test_pcm) + encoder.flush()
+        record("lameenc MP3 encoder initialization & flush", len(mp3_out) > 0)
+    except Exception as exc:
+        record("lameenc MP3 encoder initialization & flush", False, str(exc))
+
+    try:
+        sample_text = "Profit was 46.5 percent at 10:30 today."
+        chunks = split_text_into_chunks(sample_text)
+        record("Exact substring chunking preservation", len(chunks) == 1 and chunks[0] == sample_text)
+    except Exception as exc:
+        record("Exact substring chunking preservation", False, str(exc))
+
+    try:
+        from google.genai.errors import APIError
+        err = APIError(401, {"error": {"code": 401, "message": "API_KEY_INVALID"}})
+        info = classify_error(err)
+        record("Structured error classification (401 auth)", info.kind == "auth")
+    except Exception as exc:
+        record("Structured error classification (401 auth)", False, str(exc))
+
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(messages) + "\n")
+            f.write(f"Result: {'SUCCESS' if success else 'FAILURE'}\n")
+    except Exception:
+        pass
+
+    print("\n".join(messages))
+    return 0 if success else 1
+
+
+# ============================================================================
 # Entry Point
 # ============================================================================
 
 def main():
+    if "--selftest" in sys.argv:
+        exit_code = run_selftest()
+        sys.exit(exit_code)
+
     root = tk.Tk()
     app = TTSBatchApp(root)
     root.mainloop()
