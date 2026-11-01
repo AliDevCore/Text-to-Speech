@@ -2,7 +2,7 @@
 
 All source code, identifiers, comments, and labels are written in English.
 Style preset labels in Persian are represented strictly using \\uXXXX escape sequences.
-Features a modern, high-contrast dark theme matching Online Subtitle Generator.
+Features direct in-place grid editing, rich real-time logging, and modern dark styling.
 """
 
 import os
@@ -64,6 +64,7 @@ COLOR_DISABLED_BG = "#27272a"
 COLOR_DISABLED_FG = "#71717a"
 COLOR_TREE_HEADER = "#1e293b"
 COLOR_SUCCESS = "#22c55e"
+COLOR_WARN = "#f59e0b"
 
 # Fixed list of supported Gemini TTS voices
 VOICES = [
@@ -437,15 +438,15 @@ def is_rate_limit_error(exc: Exception) -> bool:
 
 
 # ============================================================================
-# Main Application GUI (Modern Dark Theme)
+# Main Application GUI (Modern Dark Theme with In-Place Grid Editing)
 # ============================================================================
 
 class TTSBatchApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_NAME} — {APP_SUBTITLE}")
-        self.root.geometry("900x670")
-        self.root.minsize(780, 540)
+        self.root.geometry("940x780")
+        self.root.minsize(820, 640)
         self.root.configure(bg=COLOR_WINDOW_BG)
 
         # State
@@ -454,6 +455,7 @@ class TTSBatchApp:
         self.is_processing = False
         self.stop_event = threading.Event()
         self.queue: queue.Queue = queue.Queue()
+        self.active_cell_editor: ttk.Combobox | None = None
 
         # Apply Modern Dark Stylesheet
         self._setup_dark_theme()
@@ -461,11 +463,14 @@ class TTSBatchApp:
         # Build UI
         self._build_ui()
 
+        # Initial greeting in the log
+        self.log(f"{APP_NAME} initialized. Ready for batch processing.", "ok")
+
         # Load persisted API key
         saved_key = load_api_key()
         if saved_key:
             self.api_key_var.set(saved_key)
-            self.log("Loaded saved API key from encrypted storage.")
+            self.log("Loaded saved API key from Windows DPAPI encrypted storage.", "ok")
 
         # Start queue polling
         self.root.after(100, self._process_queue)
@@ -654,7 +659,7 @@ class TTSBatchApp:
         # Row 1: API Key Card
         # --------------------------------------------------------------------
         api_card = ttk.LabelFrame(main_container, text=" Gemini API Configuration ", padding="8")
-        api_card.pack(fill=tk.X, pady=(0, 10))
+        api_card.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(api_card, text="Gemini API Key:", style="Card.TLabel").pack(side=tk.LEFT, padx=(4, 8))
 
@@ -675,34 +680,45 @@ class TTSBatchApp:
         self.show_check.pack(side=tk.LEFT, padx=(0, 4))
 
         # --------------------------------------------------------------------
-        # Row 2: File Queue Card (Treeview)
+        # Row 2: File Queue Card (Treeview with direct in-place editing)
         # --------------------------------------------------------------------
-        list_card = ttk.LabelFrame(main_container, text=" Batch Conversion Queue ", padding="8")
-        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        list_card = ttk.LabelFrame(
+            main_container,
+            text=" Batch Conversion Queue (Click or double-click Voice or Style in grid to edit directly) ",
+            padding="8",
+        )
+        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         tree_container = ttk.Frame(list_card, style="Card.TFrame")
         tree_container.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         columns = ("filepath", "voice", "style", "status")
-        self.tree = ttk.Treeview(tree_container, columns=columns, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(
+            tree_container, columns=columns, show="headings", selectmode="extended", height=6
+        )
 
         self.tree.heading("filepath", text="File Path", anchor=tk.W)
-        self.tree.heading("voice", text="Voice", anchor=tk.CENTER)
-        self.tree.heading("style", text="Style", anchor=tk.CENTER)
+        self.tree.heading("voice", text="Voice ▾", anchor=tk.CENTER)
+        self.tree.heading("style", text="Style ▾", anchor=tk.CENTER)
         self.tree.heading("status", text="Status", anchor=tk.CENTER)
 
         self.tree.column("filepath", width=420, anchor=tk.W, stretch=True)
-        self.tree.column("voice", width=110, anchor=tk.CENTER, stretch=False)
-        self.tree.column("style", width=180, anchor=tk.CENTER, stretch=False)
+        self.tree.column("voice", width=120, anchor=tk.CENTER, stretch=False)
+        self.tree.column("style", width=200, anchor=tk.CENTER, stretch=False)
         self.tree.column("status", width=160, anchor=tk.CENTER, stretch=False)
 
-        tree_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview, style="Vertical.TScrollbar")
+        tree_scroll = ttk.Scrollbar(
+            tree_container, orient=tk.VERTICAL, command=self.tree.yview, style="Vertical.TScrollbar"
+        )
         self.tree.configure(yscrollcommand=tree_scroll.set)
 
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # Selection and in-place cell editing bindings
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Button-1>", self._on_tree_cell_click)
+        self.tree.bind("<Double-Button-1>", self._on_tree_cell_click)
 
         # Action buttons for the queue
         btn_bar = ttk.Frame(list_card, style="Card.TFrame")
@@ -720,8 +736,8 @@ class TTSBatchApp:
         # --------------------------------------------------------------------
         # Row 3: Settings Panel Card
         # --------------------------------------------------------------------
-        settings_card = ttk.LabelFrame(main_container, text=" Voice & Style Settings for Selected File(s) ", padding="10")
-        settings_card.pack(fill=tk.X, pady=(0, 10))
+        settings_card = ttk.LabelFrame(main_container, text=" Voice & Style Settings for Selected File(s) ", padding="8")
+        settings_card.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(settings_card, text="Voice:", style="Card.TLabel").grid(row=0, column=0, padx=(4, 6), sticky=tk.W)
         self.voice_var = tk.StringVar(value=self.last_applied_voice)
@@ -747,7 +763,7 @@ class TTSBatchApp:
         # Row 4: Action & Progress Row
         # --------------------------------------------------------------------
         action_frame = ttk.Frame(main_container)
-        action_frame.pack(fill=tk.X, pady=(0, 10))
+        action_frame.pack(fill=tk.X, pady=(0, 8))
 
         self.start_btn = ttk.Button(action_frame, text="▶ Start Batch", command=self._start_batch, style="Primary.TButton")
         self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -762,14 +778,14 @@ class TTSBatchApp:
         self.progress_label.pack(side=tk.RIGHT)
 
         # --------------------------------------------------------------------
-        # Row 5: Activity Log Card
+        # Row 5: Activity Log Card (Always visible, expansive console)
         # --------------------------------------------------------------------
         log_card = ttk.LabelFrame(main_container, text=" Activity Log ", padding="8")
-        log_card.pack(fill=tk.BOTH, expand=False)
+        log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 2))
 
         self.log_text = ScrolledText(
             log_card,
-            height=6,
+            height=8,
             wrap=tk.WORD,
             state="disabled",
             bg=COLOR_INPUT_BG,
@@ -783,8 +799,11 @@ class TTSBatchApp:
             relief="flat",
         )
         self.log_text.tag_configure("time", foreground=COLOR_ACCENT_CYAN)
-        self.log_text.tag_configure("err", foreground=COLOR_DANGER)
         self.log_text.tag_configure("ok", foreground=COLOR_SUCCESS)
+        self.log_text.tag_configure("err", foreground=COLOR_DANGER)
+        self.log_text.tag_configure("warn", foreground=COLOR_WARN)
+        self.log_text.tag_configure("sub", foreground=COLOR_TEXT_MUTED)
+        self.log_text.tag_configure("info", foreground=COLOR_TEXT_PRIMARY)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         # Attach universal clipboard handling (context menu & keycodes)
@@ -792,7 +811,97 @@ class TTSBatchApp:
         self._attach_universal_clipboard(self.style_cb)
 
     # ------------------------------------------------------------------------
-    # UI Callbacks & Handlers
+    # In-Place Grid Editing (Voice & Style)
+    # ------------------------------------------------------------------------
+
+    def _on_tree_cell_click(self, event):
+        """Detect clicks on Voice or Style column to open in-place dropdown editor."""
+        if self.is_processing:
+            return
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        column = self.tree.identify_column(event.x)
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+
+        if column in ("#2", "#3"):
+            # Delay slightly to allow selection to update
+            self.root.after(20, lambda: self._open_cell_editor(row_id, column))
+
+    def _open_cell_editor(self, row_id: str, column: str):
+        if self.is_processing or not self.tree.exists(row_id):
+            return
+
+        if self.active_cell_editor and self.active_cell_editor.winfo_exists():
+            self.active_cell_editor.destroy()
+            self.active_cell_editor = None
+
+        if column == "#2":
+            self._edit_grid_cell(row_id, column, "voice", VOICES, is_readonly=True)
+        elif column == "#3":
+            self._edit_grid_cell(row_id, column, "style", list(STYLE_PRESETS.keys()), is_readonly=False)
+
+    def _edit_grid_cell(self, row_id: str, col_id: str, col_name: str, values: list[str], is_readonly: bool):
+        bbox = self.tree.bbox(row_id, col_id)
+        if not bbox:
+            return
+        x, y, width, height = bbox
+        current_val = self.tree.set(row_id, col_name)
+
+        cb = ttk.Combobox(
+            self.tree,
+            values=values,
+            state="readonly" if is_readonly else "normal",
+        )
+        cb.set(current_val)
+        cb.place(x=x, y=y, width=width, height=height)
+        cb.focus_set()
+        self.active_cell_editor = cb
+
+        def commit(evt=None):
+            if not cb.winfo_exists():
+                return
+            new_val = cb.get().strip()
+            if new_val:
+                self.tree.set(row_id, col_name, new_val)
+                file_name = os.path.basename(self.tree.set(row_id, "filepath"))
+                if col_name == "voice":
+                    self.last_applied_voice = new_val
+                    self.voice_var.set(new_val)
+                    self.log(f"Grid edit: Set Voice of '{file_name}' to '{new_val}'.", "info")
+                elif col_name == "style":
+                    self.last_applied_style = new_val
+                    self.style_var.set(new_val)
+                    self.log(f"Grid edit: Set Style of '{file_name}' to '{new_val}'.", "info")
+            cb.destroy()
+            self.active_cell_editor = None
+
+        def cancel(evt=None):
+            if cb.winfo_exists():
+                cb.destroy()
+            self.active_cell_editor = None
+
+        cb.bind("<<ComboboxSelected>>", commit)
+        cb.bind("<Return>", commit)
+        cb.bind("<Escape>", cancel)
+
+        def on_focus_out(event):
+            def check():
+                try:
+                    fw = self.root.focus_get()
+                    if fw and ("combobox" in str(fw).lower() or "listbox" in str(fw).lower()):
+                        return
+                    commit()
+                except Exception:
+                    pass
+            self.root.after(120, check)
+
+        cb.bind("<FocusOut>", on_focus_out)
+
+    # ------------------------------------------------------------------------
+    # Clipboard & UI Handlers
     # ------------------------------------------------------------------------
 
     def _paste_api_key(self):
@@ -800,7 +909,7 @@ class TTSBatchApp:
             clip = self.root.clipboard_get().strip()
             if clip:
                 self.api_key_var.set(clip)
-                self.log("Pasted API key from clipboard.")
+                self.log("Pasted API key from clipboard.", "ok")
             else:
                 messagebox.showinfo("Clipboard Empty", "The clipboard does not contain any text.")
         except Exception as exc:
@@ -876,21 +985,17 @@ class TTSBatchApp:
         widget.bind("<Button-3>", show_popup)
 
         def on_ctrl_key(event):
-            # event.state & 4 indicates Control key held on Windows
             if event.state & 4:
                 # 86 = Keycode for 'V' on Windows across all keyboard layouts
                 if event.keycode == 86:
                     do_paste()
                     return "break"
-                # 67 = Keycode for 'C'
                 elif event.keycode == 67:
                     do_copy()
                     return "break"
-                # 88 = Keycode for 'X'
                 elif event.keycode == 88:
                     do_cut()
                     return "break"
-                # 65 = Keycode for 'A'
                 elif event.keycode == 65:
                     do_select_all()
                     return "break"
@@ -958,7 +1063,7 @@ class TTSBatchApp:
             added_count += 1
 
         if added_count > 0:
-            self.log(f"Added {added_count} file(s) to queue.")
+            self.log(f"Added {added_count} file(s) to conversion queue.", "info")
 
     def _remove_selected(self):
         if self.is_processing:
@@ -970,7 +1075,7 @@ class TTSBatchApp:
         count = len(selected)
         for item in selected:
             self.tree.delete(item)
-        self.log(f"Removed {count} file(s) from list.")
+        self.log(f"Removed {count} file(s) from queue.", "info")
 
     def _clear_list(self):
         if self.is_processing:
@@ -981,7 +1086,7 @@ class TTSBatchApp:
             return
         for item in items:
             self.tree.delete(item)
-        self.log("Cleared file list.")
+        self.log("Cleared all files from conversion queue.", "info")
 
     def _apply_settings(self):
         selected = self.tree.selection()
@@ -997,7 +1102,7 @@ class TTSBatchApp:
 
         self.last_applied_voice = voice_val
         self.last_applied_style = style_val
-        self.log(f"Applied settings to {len(selected)} selected file(s): Voice={voice_val}, Style={style_val}")
+        self.log(f"Applied settings to {len(selected)} selected file(s): Voice={voice_val}, Style={style_val}", "info")
 
     def _apply_to_all(self):
         items = self.tree.get_children()
@@ -1013,7 +1118,7 @@ class TTSBatchApp:
 
         self.last_applied_voice = voice_val
         self.last_applied_style = style_val
-        self.log(f"Applied settings to all {len(items)} file(s): Voice={voice_val}, Style={style_val}")
+        self.log(f"Applied settings to all {len(items)} file(s): Voice={voice_val}, Style={style_val}", "info")
 
     def _start_batch(self):
         if self.is_processing:
@@ -1071,7 +1176,7 @@ class TTSBatchApp:
 
         self.progress_bar.configure(value=0, maximum=100)
         self.progress_label.configure(text="Starting...")
-        self.log("Starting batch processing...")
+        self.log(f"Starting batch conversion of {len(file_records)} file(s)...", "info")
 
         worker = threading.Thread(
             target=self._worker_thread,
@@ -1085,30 +1190,49 @@ class TTSBatchApp:
             return
         self.stop_event.set()
         self.stop_btn.configure(state="disabled")
-        self.log("Stop requested. Waiting for current chunk to finish...")
+        self.log("Stop requested by user. Waiting for current chunk to finish...", "warn")
         self.progress_label.configure(text="Stopping...")
 
     def _worker_thread(self, file_records: list[tuple[str, str, str, str]], api_key: str):
-        """Sequential background processing worker for files and chunks."""
+        """Sequential background processing worker for files and chunks with rich logging."""
         is_mock = os.environ.get("TTS_MOCK") == "1"
         client = None
-        if not is_mock:
+
+        if is_mock:
+            self.queue.put(("log", "[MOCK MODE] Network calls bypassed. Generating 1s silence per chunk.", "warn"))
+        else:
+            self.queue.put(("log", "Connecting to Gemini API...", "info"))
             try:
                 client = genai.Client(api_key=api_key)
+                self.queue.put(("log", f"Connected to Gemini API using model '{MODEL_NAME}'.", "ok"))
             except Exception as exc:
-                self.queue.put(("auth_error", f"Failed to initialize Gemini client: {exc}"))
+                self.queue.put(("auth_error", f"Failed to connect to Gemini API: {exc}"))
                 return
 
+        # Pre-extract, inspect and chunk all files
         prepared_files: list[dict] = []
         total_chunks = 0
 
         for item_id, file_path, voice, style in file_records:
+            base_name = os.path.basename(file_path)
+            ext = os.path.splitext(base_name)[1].lower()
+            self.queue.put(("log", f"Inspecting and extracting text from '{base_name}' ({ext})...", "info"))
+
             try:
                 text = extract_text(file_path)
+                char_count = len(text)
+                self.queue.put(("log", f"  Extracted {char_count:,} characters from '{base_name}'.", "sub"))
+
                 chunks = split_text_into_chunks(text, MAX_CHARS)
                 if not chunks:
                     raise ValueError("no text found")
+
                 total_chunks += len(chunks)
+                self.queue.put(("log", f"  Chunked into {len(chunks)} piece(s) (limit: {MAX_CHARS} chars/chunk):", "sub"))
+                for c_idx, c in enumerate(chunks, start=1):
+                    preview = c[:45].replace("\n", " ") + ("..." if len(c) > 45 else "")
+                    self.queue.put(("log", f"    * Chunk {c_idx}/{len(chunks)}: {len(c):,} chars -> \"{preview}\"", "sub"))
+
                 prepared_files.append({
                     "item_id": item_id,
                     "file_path": file_path,
@@ -1119,6 +1243,7 @@ class TTSBatchApp:
                 })
             except Exception as exc:
                 short_err = str(exc)
+                self.queue.put(("log", f"  Extraction error on '{base_name}': {short_err}", "err"))
                 prepared_files.append({
                     "item_id": item_id,
                     "file_path": file_path,
@@ -1129,6 +1254,7 @@ class TTSBatchApp:
                 })
 
         self.queue.put(("progress_init", total_chunks))
+        self.queue.put(("log", f"Total chunks across batch: {total_chunks}.", "info"))
 
         completed_chunks = 0
         auth_failed = False
@@ -1140,6 +1266,7 @@ class TTSBatchApp:
             style = file_info["style"]
             chunks = file_info["chunks"]
             preload_error = file_info["error"]
+            base_name = os.path.basename(file_path)
 
             if self.stop_event.is_set():
                 self.queue.put(("item_status", item_id, "Stopped"))
@@ -1151,7 +1278,7 @@ class TTSBatchApp:
 
             if preload_error:
                 self.queue.put(("item_status", item_id, f"Error: {preload_error}"))
-                self.queue.put(("log", f"Failed to process '{os.path.basename(file_path)}': {preload_error}"))
+                self.queue.put(("log", f"Skipping '{base_name}' due to error: {preload_error}", "err"))
                 continue
 
             output_mp3 = os.path.splitext(file_path)[0] + ".mp3"
@@ -1161,12 +1288,12 @@ class TTSBatchApp:
             file_failed = False
             file_err_msg = ""
 
-            self.queue.put(("log", f"Processing '{os.path.basename(file_path)}' ({num_chunks} chunks, Voice: {voice})..."))
+            self.queue.put(("log", f"Processing '{base_name}' ({num_chunks} chunks, Voice: '{voice}', Style: '{style}')...", "info"))
 
             for idx, chunk in enumerate(chunks, start=1):
                 if self.stop_event.is_set():
                     self.queue.put(("item_status", item_id, "Stopped"))
-                    self.queue.put(("log", f"Stopped while processing '{os.path.basename(file_path)}'."))
+                    self.queue.put(("log", f"Stopped while processing '{base_name}'.", "warn"))
                     break
 
                 self.queue.put(("item_status", item_id, f"Processing (chunk {idx}/{num_chunks})"))
@@ -1174,11 +1301,17 @@ class TTSBatchApp:
                 style_instruction = resolve_style_instruction(style)
                 prompt_text = build_prompt(style_instruction, chunk)
 
+                self.queue.put(("log", f"Sending chunk {idx}/{num_chunks} ({len(chunk):,} chars) to Gemini TTS...", "info"))
+                if style_instruction:
+                    self.queue.put(("log", f"  Instruction: \"{style_instruction}\"", "sub"))
+
                 chunk_pcm, chunk_rate, err = self._fetch_audio_chunk_with_retry(
                     client=client,
                     prompt_text=prompt_text,
                     voice=voice,
                     is_mock=is_mock,
+                    chunk_idx=idx,
+                    total_chunks=num_chunks,
                 )
 
                 if err:
@@ -1192,6 +1325,12 @@ class TTSBatchApp:
                 if chunk_rate:
                     detected_sample_rate = chunk_rate
 
+                self.queue.put((
+                    "log",
+                    f"  Received chunk {idx}/{num_chunks} audio: {len(chunk_pcm):,} bytes PCM ({chunk_rate} Hz).",
+                    "sub",
+                ))
+
                 completed_chunks += 1
                 self.queue.put(("progress_update", completed_chunks, total_chunks))
 
@@ -1204,19 +1343,25 @@ class TTSBatchApp:
                 if len(short_reason) > 35:
                     short_reason = short_reason[:32] + "..."
                 self.queue.put(("item_status", item_id, f"Error: {short_reason}"))
-                self.queue.put(("log", f"Error on '{os.path.basename(file_path)}': {file_err_msg}"))
+                self.queue.put(("log", f"Failed '{base_name}': {file_err_msg}", "err"))
                 if auth_failed:
-                    self.queue.put(("log", "Authentication failure detected. Halting remaining files."))
+                    self.queue.put(("log", "Authentication failure detected. Halting remaining queue.", "err"))
                 continue
 
+            # Encode all accumulated PCM chunks to MP3
             try:
+                self.queue.put((
+                    "log",
+                    f"Encoding {len(pcm_accumulator):,} total PCM bytes into MP3 with lameenc (64 kbps mono)...",
+                    "info",
+                ))
                 save_pcm_as_mp3(bytes(pcm_accumulator), detected_sample_rate, output_mp3)
                 file_size_kb = os.path.getsize(output_mp3) / 1024.0
                 self.queue.put(("item_status", item_id, "Done"))
-                self.queue.put(("log", f"Finished '{os.path.basename(output_mp3)}' ({file_size_kb:.1f} KB)."))
+                self.queue.put(("log", f"Saved MP3: '{os.path.basename(output_mp3)}' ({file_size_kb:.1f} KB).", "ok"))
             except Exception as save_exc:
                 self.queue.put(("item_status", item_id, "Error: save failed"))
-                self.queue.put(("log", f"Failed to save MP3 for '{os.path.basename(file_path)}': {save_exc}"))
+                self.queue.put(("log", f"Failed to save MP3 for '{base_name}': {save_exc}", "err"))
 
         if self.stop_event.is_set():
             self.queue.put(("batch_stopped", None))
@@ -1224,7 +1369,7 @@ class TTSBatchApp:
             self.queue.put(("batch_done", None))
 
     def _fetch_audio_chunk_with_retry(
-        self, client: genai.Client | None, prompt_text: str, voice: str, is_mock: bool
+        self, client: genai.Client | None, prompt_text: str, voice: str, is_mock: bool, chunk_idx: int, total_chunks: int
     ) -> tuple[bytes, int, str | None]:
         """Fetch TTS audio for a single chunk with retry backoff (2s, 4s)."""
         if is_mock:
@@ -1290,10 +1435,10 @@ class TTSBatchApp:
 
                 if is_rate_limit_error(exc):
                     delay = 7.0 * (attempt + 1)
-                    self.queue.put(("log", f"Rate limit reached (429). Waiting {delay:.0f}s before retry..."))
+                    self.queue.put(("log", f"Rate limit reached (429) on chunk {chunk_idx}. Waiting {delay:.0f}s before retry...", "warn"))
                 else:
                     delay = backoff_delays[attempt]
-                    self.queue.put(("log", f"API warning ({exc}). Retrying in {delay:.0f}s (attempt {attempt + 2}/{max_retries})..."))
+                    self.queue.put(("log", f"API warning on chunk {chunk_idx}: {exc}. Retrying in {delay:.0f}s (attempt {attempt + 2}/{max_retries})...", "warn"))
 
                 sleep_passed = 0.0
                 while sleep_passed < delay:
@@ -1311,9 +1456,13 @@ class TTSBatchApp:
     def _process_queue(self):
         try:
             while True:
-                msg_type, *args = self.queue.get_nowait()
+                msg = self.queue.get_nowait()
+                msg_type = msg[0]
+                args = msg[1:]
                 if msg_type == "log":
-                    self.log(args[0])
+                    text = args[0]
+                    tag = args[1] if len(args) > 1 else None
+                    self.log(text, tag)
                 elif msg_type == "item_status":
                     item_id, status_val = args[0], args[1]
                     if self.tree.exists(item_id):
@@ -1332,7 +1481,7 @@ class TTSBatchApp:
                 elif msg_type == "batch_stopped":
                     self._on_batch_finished(stopped=True)
                 elif msg_type == "auth_error":
-                    self.log(f"ERROR: {args[0]}")
+                    self.log(f"ERROR: {args[0]}", "err")
                     messagebox.showerror("Authentication Error", args[0])
                     self._on_batch_finished(stopped=True)
         except queue.Empty:
@@ -1352,22 +1501,31 @@ class TTSBatchApp:
 
         if stopped:
             self.progress_label.configure(text="Stopped")
-            self.log("Batch processing stopped.")
+            self.log("Batch processing stopped.", "warn")
         else:
             self.progress_label.configure(text="Completed")
-            self.log("All files in batch completed.")
+            self.log("All files in batch completed successfully!", "ok")
 
-    def log(self, message: str):
-        """Append a message to the activity log text widget."""
+    def log(self, message: str, tag: str | None = None):
+        """Append a message to the activity log text widget with rich syntax colors."""
         timestamp = time.strftime("[%H:%M:%S] ")
         self.log_text.configure(state="normal")
         self.log_text.insert(tk.END, timestamp, "time")
-        if "error" in message.lower() or "failed" in message.lower():
-            self.log_text.insert(tk.END, message + "\n", "err")
-        elif "finished" in message.lower() or "completed" in message.lower():
-            self.log_text.insert(tk.END, message + "\n", "ok")
-        else:
-            self.log_text.insert(tk.END, message + "\n")
+
+        if tag is None:
+            msg_lower = message.lower()
+            if "error" in msg_lower or "failed" in msg_lower:
+                tag = "err"
+            elif "success" in msg_lower or "finished" in msg_lower or "completed" in msg_lower or "connected to" in msg_lower or "saved mp3" in msg_lower:
+                tag = "ok"
+            elif "warning" in msg_lower or "retry" in msg_lower or "warn" in msg_lower:
+                tag = "warn"
+            elif message.startswith("  "):
+                tag = "sub"
+            else:
+                tag = "info"
+
+        self.log_text.insert(tk.END, message + "\n", tag)
         self.log_text.see(tk.END)
         self.log_text.configure(state="disabled")
 
