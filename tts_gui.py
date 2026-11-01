@@ -2,6 +2,7 @@
 
 All source code, identifiers, comments, and labels are written in English.
 Style preset labels in Persian are represented strictly using \\uXXXX escape sequences.
+Features a modern, high-contrast dark theme matching Online Subtitle Generator.
 """
 
 import os
@@ -31,14 +32,38 @@ from google.genai import errors
 
 
 # ============================================================================
-# Constants
+# Constants & Modern Dark Theme Palette
 # ============================================================================
+
+APP_NAME = "Text to Speech Batch"
+APP_SUBTITLE = "AI Audio Studio"
 
 MODEL_NAME = "gemini-3.8-flash-tts"
 MAX_CHARS = 3000
 MP3_BITRATE_KBPS = 64
 MP3_QUALITY = 2
 DEFAULT_SAMPLE_RATE = 24000
+
+# Color Palette (Matching Online Subtitle Generator / Modern Dark Windows)
+COLOR_WINDOW_BG = "#1e1e24"
+COLOR_CARD_BG = "#252836"
+COLOR_INPUT_BG = "#181a20"
+COLOR_BORDER = "#334155"
+COLOR_BORDER_FOCUS = "#38bdf8"
+COLOR_TEXT_PRIMARY = "#f8fafc"
+COLOR_TEXT_SECONDARY = "#cbd5e1"
+COLOR_TEXT_MUTED = "#94a3b8"
+COLOR_ACCENT_BLUE = "#0284c7"
+COLOR_ACCENT_HOVER = "#0369a1"
+COLOR_ACCENT_CYAN = "#38bdf8"
+COLOR_DANGER = "#dc2626"
+COLOR_DANGER_HOVER = "#b91c1c"
+COLOR_SECONDARY = "#334155"
+COLOR_SECONDARY_HOVER = "#475569"
+COLOR_DISABLED_BG = "#27272a"
+COLOR_DISABLED_FG = "#71717a"
+COLOR_TREE_HEADER = "#1e293b"
+COLOR_SUCCESS = "#22c55e"
 
 # Fixed list of supported Gemini TTS voices
 VOICES = [
@@ -98,7 +123,7 @@ def protect_data(plain_bytes: bytes) -> bytes:
         raise OSError("DPAPI is only supported on Windows")
     crypt32 = ctypes.windll.crypt32
     kernel32 = ctypes.windll.kernel32
-    
+
     in_blob = DATA_BLOB(
         len(plain_bytes),
         ctypes.cast(ctypes.create_string_buffer(plain_bytes), ctypes.POINTER(ctypes.c_byte)),
@@ -120,7 +145,7 @@ def unprotect_data(cipher_bytes: bytes) -> bytes:
         raise OSError("DPAPI is only supported on Windows")
     crypt32 = ctypes.windll.crypt32
     kernel32 = ctypes.windll.kernel32
-    
+
     in_blob = DATA_BLOB(
         len(cipher_bytes),
         ctypes.cast(ctypes.create_string_buffer(cipher_bytes), ctypes.POINTER(ctypes.c_byte)),
@@ -154,7 +179,7 @@ def save_api_key(key: str) -> bool:
     config_path = get_config_path()
     trimmed = key.strip()
     data_to_store = {"api_key": "", "encrypted": False}
-    
+
     if trimmed:
         try:
             encrypted_bytes = protect_data(trimmed.encode("utf-8"))
@@ -162,7 +187,7 @@ def save_api_key(key: str) -> bool:
             data_to_store = {"api_key": b64_str, "encrypted": True}
         except Exception:
             data_to_store = {"api_key": trimmed, "encrypted": False}
-    
+
     try:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(data_to_store, f, indent=2)
@@ -200,7 +225,7 @@ def extract_text_from_txt(file_path: str) -> str:
     encodings = ["utf-8-sig", "utf-8", "utf-16", "cp1256"]
     with open(file_path, "rb") as f:
         raw_bytes = f.read()
-    
+
     for enc in encodings:
         try:
             text = raw_bytes.decode(enc)
@@ -218,7 +243,7 @@ def extract_text_from_docx(file_path: str) -> str:
         doc = docx.Document(file_path)
     except Exception as exc:
         raise ValueError(f"Failed to read Word document: {exc}")
-    
+
     body_blocks = []
     for child in doc.element.body:
         tag = child.tag
@@ -231,14 +256,13 @@ def extract_text_from_docx(file_path: str) -> str:
             tbl = Table(child, doc)
             table_rows = []
             for row in tbl.rows:
-                # Read cells left to right, join with space
                 row_cells = [cell.text.strip() for cell in row.cells]
                 row_text = " ".join(row_cells).strip()
                 if row_text:
                     table_rows.append(row_text)
             if table_rows:
                 body_blocks.append("\n".join(table_rows))
-    
+
     full_text = "\n\n".join(body_blocks).strip()
     if not full_text:
         raise ValueError("no text found")
@@ -258,38 +282,28 @@ def extract_text(file_path: str) -> str:
 
 
 def split_text_into_chunks(text: str, max_chars: int = MAX_CHARS) -> list[str]:
-    """Split text into chunks of at most max_chars.
-    
-    1. First split by blank-line paragraphs.
-    2. Then by sentences (split after . ! ? : newline and Arabic question mark \\u061f and Arabic semicolon \\u061b).
-    3. Hard-split any single sentence longer than max_chars.
-    4. Merge neighbouring small pieces up to max_chars.
-    """
+    """Split text into chunks of at most max_chars."""
     clean_text = text.strip()
     if not clean_text:
         return []
-    
+
     raw_paras = re.split(r"\n\s*\n+", clean_text)
-    
-    # Split after . ! ? : newline and Arabic question mark (\u061f) and Arabic semicolon (\u061b)
-    # Using positive lookbehind for one or more delimiters, not followed by another delimiter
     sentence_pattern = r"(?<=[.!?:\n\u061f\u061b])+(?![.!?:\n\u061f\u061b])\s*"
-    
-    atomic_pieces: list[tuple[str, bool]] = []  # (piece_text, is_first_piece_of_paragraph)
-    
+
+    atomic_pieces: list[tuple[str, bool]] = []
+
     for para in raw_paras:
         para_trimmed = para.strip()
         if not para_trimmed:
             continue
-        
+
         raw_sentences = [s.strip() for s in re.split(sentence_pattern, para_trimmed) if s.strip()]
         if not raw_sentences:
             continue
-        
+
         first_piece_in_para = True
         for sent in raw_sentences:
             if len(sent) > max_chars:
-                # Hard-split sentence
                 for i in range(0, len(sent), max_chars):
                     sub = sent[i:i + max_chars]
                     atomic_pieces.append((sub, first_piece_in_para))
@@ -303,22 +317,22 @@ def split_text_into_chunks(text: str, max_chars: int = MAX_CHARS) -> list[str]:
 
     chunks: list[str] = []
     current_chunk = ""
-    
+
     for piece, is_new_para in atomic_pieces:
         if not current_chunk:
             current_chunk = piece
             continue
-        
+
         sep = "\n\n" if is_new_para else " "
         if len(current_chunk) + len(sep) + len(piece) <= max_chars:
             current_chunk += sep + piece
         else:
             chunks.append(current_chunk)
             current_chunk = piece
-            
+
     if current_chunk:
         chunks.append(current_chunk)
-        
+
     return chunks
 
 
@@ -333,7 +347,6 @@ def resolve_style_instruction(style_value: str) -> str:
         return ""
     if text in STYLE_PRESETS:
         return STYLE_PRESETS[text]
-    # Free text custom style: append ':' if missing
     if not text.endswith(":"):
         return text + ":"
     return text
@@ -368,15 +381,15 @@ def save_pcm_as_mp3(pcm_data: bytes, sample_rate: int, output_mp3_path: str):
     encoder.set_channels(1)
     encoder.set_out_sample_rate(sample_rate)
     encoder.set_quality(MP3_QUALITY)
-    
+
     mp3_bytes = encoder.encode(pcm_data)
     mp3_bytes += encoder.flush()
-    
+
     out_dir = os.path.dirname(output_mp3_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     temp_path = os.path.join(out_dir, f".{os.path.basename(output_mp3_path)}.{uuid.uuid4().hex[:8]}.tmp")
-    
+
     try:
         with open(temp_path, "wb") as f:
             f.write(mp3_bytes)
@@ -424,78 +437,261 @@ def is_rate_limit_error(exc: Exception) -> bool:
 
 
 # ============================================================================
-# Main Application GUI
+# Main Application GUI (Modern Dark Theme)
 # ============================================================================
 
 class TTSBatchApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Text to Speech Batch")
-        self.root.geometry("880x640")
-        self.root.minsize(760, 520)
-        
+        self.root.title(f"{APP_NAME} — {APP_SUBTITLE}")
+        self.root.geometry("900x670")
+        self.root.minsize(780, 540)
+        self.root.configure(bg=COLOR_WINDOW_BG)
+
         # State
         self.last_applied_voice = VOICES[0]
         self.last_applied_style = DEFAULT_STYLE_LABEL
         self.is_processing = False
         self.stop_event = threading.Event()
         self.queue: queue.Queue = queue.Queue()
-        
+
+        # Apply Modern Dark Stylesheet
+        self._setup_dark_theme()
+
         # Build UI
         self._build_ui()
-        
+
         # Load persisted API key
         saved_key = load_api_key()
         if saved_key:
             self.api_key_var.set(saved_key)
-            self.log("Loaded saved API key from configuration.")
-            
+            self.log("Loaded saved API key from encrypted storage.")
+
         # Start queue polling
         self.root.after(100, self._process_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _setup_dark_theme(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        # Global Frame and Card Styles
+        style.configure("TFrame", background=COLOR_WINDOW_BG)
+        style.configure("Card.TFrame", background=COLOR_CARD_BG)
+
+        style.configure(
+            "TLabelframe",
+            background=COLOR_CARD_BG,
+            bordercolor=COLOR_BORDER,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=COLOR_CARD_BG,
+            foreground=COLOR_ACCENT_CYAN,
+            font=("Segoe UI", 10, "bold"),
+        )
+
+        # Labels
+        style.configure("TLabel", background=COLOR_WINDOW_BG, foreground=COLOR_TEXT_PRIMARY, font=("Segoe UI", 9))
+        style.configure("Card.TLabel", background=COLOR_CARD_BG, foreground=COLOR_TEXT_PRIMARY, font=("Segoe UI", 9))
+        style.configure("HeaderTitle.TLabel", background=COLOR_WINDOW_BG, foreground=COLOR_TEXT_PRIMARY, font=("Segoe UI", 13, "bold"))
+        style.configure("HeaderTag.TLabel", background=COLOR_WINDOW_BG, foreground=COLOR_ACCENT_CYAN, font=("Segoe UI", 10, "bold"))
+
+        # Primary Action Button (Start)
+        style.configure(
+            "Primary.TButton",
+            background=COLOR_ACCENT_BLUE,
+            foreground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            borderwidth=0,
+            padding=6,
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", COLOR_ACCENT_HOVER), ("disabled", COLOR_DISABLED_BG)],
+            foreground=[("disabled", COLOR_DISABLED_FG)],
+        )
+
+        # Danger Button (Stop)
+        style.configure(
+            "Danger.TButton",
+            background=COLOR_DANGER,
+            foreground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            borderwidth=0,
+            padding=6,
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("active", COLOR_DANGER_HOVER), ("disabled", COLOR_DISABLED_BG)],
+            foreground=[("disabled", COLOR_DISABLED_FG)],
+        )
+
+        # Secondary Button
+        style.configure(
+            "Secondary.TButton",
+            background=COLOR_SECONDARY,
+            foreground=COLOR_TEXT_PRIMARY,
+            font=("Segoe UI", 9),
+            borderwidth=0,
+            padding=5,
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[("active", COLOR_SECONDARY_HOVER), ("disabled", COLOR_DISABLED_BG)],
+            foreground=[("disabled", COLOR_DISABLED_FG)],
+        )
+
+        # Text Entry
+        style.configure(
+            "TEntry",
+            fieldbackground=COLOR_INPUT_BG,
+            foreground=COLOR_TEXT_PRIMARY,
+            insertcolor=COLOR_ACCENT_CYAN,
+            bordercolor=COLOR_BORDER,
+            lightcolor=COLOR_BORDER,
+            darkcolor=COLOR_BORDER,
+            padding=5,
+        )
+
+        # Dropdowns (Combobox)
+        style.configure(
+            "TCombobox",
+            fieldbackground=COLOR_INPUT_BG,
+            foreground=COLOR_TEXT_PRIMARY,
+            bordercolor=COLOR_BORDER,
+            arrowcolor=COLOR_ACCENT_CYAN,
+            padding=4,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", COLOR_INPUT_BG)],
+            selectbackground=[("readonly", COLOR_INPUT_BG)],
+            selectforeground=[("readonly", COLOR_TEXT_PRIMARY)],
+        )
+        self.root.option_add("*TCombobox*Listbox.background", COLOR_INPUT_BG)
+        self.root.option_add("*TCombobox*Listbox.foreground", COLOR_TEXT_PRIMARY)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", COLOR_ACCENT_BLUE)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+
+        # Checkbutton
+        style.configure(
+            "TCheckbutton",
+            background=COLOR_WINDOW_BG,
+            foreground=COLOR_TEXT_PRIMARY,
+            focuscolor=COLOR_WINDOW_BG,
+            font=("Segoe UI", 9),
+        )
+        style.map("TCheckbutton", background=[("active", COLOR_WINDOW_BG)])
+
+        # Treeview (File Queue)
+        style.configure(
+            "Treeview",
+            background=COLOR_INPUT_BG,
+            foreground=COLOR_TEXT_PRIMARY,
+            fieldbackground=COLOR_INPUT_BG,
+            bordercolor=COLOR_BORDER,
+            borderwidth=1,
+            rowheight=26,
+            font=("Segoe UI", 9),
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", COLOR_ACCENT_BLUE)],
+            foreground=[("selected", "#ffffff")],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=COLOR_TREE_HEADER,
+            foreground=COLOR_ACCENT_CYAN,
+            font=("Segoe UI", 9, "bold"),
+            relief="flat",
+            padding=4,
+        )
+        style.map("Treeview.Heading", background=[("active", COLOR_SECONDARY)])
+
+        # Progressbar
+        style.configure(
+            "Horizontal.TProgressbar",
+            background=COLOR_ACCENT_BLUE,
+            troughcolor=COLOR_INPUT_BG,
+            bordercolor=COLOR_BORDER,
+            lightcolor=COLOR_ACCENT_BLUE,
+            darkcolor=COLOR_ACCENT_BLUE,
+        )
+
+        # Scrollbars
+        style.configure(
+            "Vertical.TScrollbar",
+            background=COLOR_SECONDARY,
+            troughcolor=COLOR_WINDOW_BG,
+            bordercolor=COLOR_WINDOW_BG,
+            arrowcolor=COLOR_TEXT_SECONDARY,
+        )
+
     def _build_ui(self):
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_container = ttk.Frame(self.root, padding="14")
+        main_container.pack(fill=tk.BOTH, expand=True)
 
         # --------------------------------------------------------------------
-        # Row 1: API Key Row
+        # Top Title Bar
         # --------------------------------------------------------------------
-        api_frame = ttk.Frame(main_frame)
-        api_frame.pack(fill=tk.X, pady=(0, 8))
+        top_bar = ttk.Frame(main_container)
+        top_bar.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(api_frame, text="Gemini API Key:").pack(side=tk.LEFT, padx=(0, 6))
+        title_lbl = ttk.Label(top_bar, text=APP_NAME, style="HeaderTitle.TLabel")
+        title_lbl.pack(side=tk.LEFT)
+
+        tag_lbl = ttk.Label(top_bar, text=f" — {APP_SUBTITLE}", style="HeaderTag.TLabel")
+        tag_lbl.pack(side=tk.LEFT)
+
+        # --------------------------------------------------------------------
+        # Row 1: API Key Card
+        # --------------------------------------------------------------------
+        api_card = ttk.LabelFrame(main_container, text=" Gemini API Configuration ", padding="8")
+        api_card.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(api_card, text="Gemini API Key:", style="Card.TLabel").pack(side=tk.LEFT, padx=(4, 8))
 
         self.api_key_var = tk.StringVar()
-        self.api_entry = ttk.Entry(api_frame, textvariable=self.api_key_var, show="*")
-        self.api_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.api_entry = ttk.Entry(api_card, textvariable=self.api_key_var, show="*")
+        self.api_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
         self.show_key_var = tk.BooleanVar(value=False)
         self.show_check = ttk.Checkbutton(
-            api_frame, text="Show", variable=self.show_key_var, command=self._toggle_show_key
+            api_card, text="Show", variable=self.show_key_var, command=self._toggle_show_key
         )
-        self.show_check.pack(side=tk.LEFT)
+        self.show_check.configure(style="TCheckbutton")
+        self.show_check.pack(side=tk.LEFT, padx=(0, 4))
 
         # --------------------------------------------------------------------
-        # Row 2: File List (Treeview)
+        # Row 2: File Queue Card (Treeview)
         # --------------------------------------------------------------------
-        list_container = ttk.Frame(main_frame)
-        list_container.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        list_card = ttk.LabelFrame(main_container, text=" Batch Conversion Queue ", padding="8")
+        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        tree_container = ttk.Frame(list_card, style="Card.TFrame")
+        tree_container.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         columns = ("filepath", "voice", "style", "status")
-        self.tree = ttk.Treeview(list_container, columns=columns, show="headings", selectmode="extended")
-        
+        self.tree = ttk.Treeview(tree_container, columns=columns, show="headings", selectmode="extended")
+
         self.tree.heading("filepath", text="File Path", anchor=tk.W)
         self.tree.heading("voice", text="Voice", anchor=tk.CENTER)
         self.tree.heading("style", text="Style", anchor=tk.CENTER)
         self.tree.heading("status", text="Status", anchor=tk.CENTER)
 
         self.tree.column("filepath", width=420, anchor=tk.W, stretch=True)
-        self.tree.column("voice", width=100, anchor=tk.CENTER, stretch=False)
+        self.tree.column("voice", width=110, anchor=tk.CENTER, stretch=False)
         self.tree.column("style", width=180, anchor=tk.CENTER, stretch=False)
         self.tree.column("status", width=160, anchor=tk.CENTER, stretch=False)
 
-        tree_scroll = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.tree.yview)
+        tree_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview, style="Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=tree_scroll.set)
 
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -503,70 +699,87 @@ class TTSBatchApp:
 
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
-        # Buttons under the file list
-        btn_bar = ttk.Frame(main_frame)
-        btn_bar.pack(fill=tk.X, pady=(0, 8))
+        # Action buttons for the queue
+        btn_bar = ttk.Frame(list_card, style="Card.TFrame")
+        btn_bar.pack(fill=tk.X)
 
-        self.add_btn = ttk.Button(btn_bar, text="Add files...", command=self._add_files)
+        self.add_btn = ttk.Button(btn_bar, text="+ Add files...", command=self._add_files, style="Secondary.TButton")
         self.add_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.remove_btn = ttk.Button(btn_bar, text="Remove selected", command=self._remove_selected)
+        self.remove_btn = ttk.Button(btn_bar, text="- Remove selected", command=self._remove_selected, style="Secondary.TButton")
         self.remove_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.clear_btn = ttk.Button(btn_bar, text="Clear list", command=self._clear_list)
+        self.clear_btn = ttk.Button(btn_bar, text="Clear list", command=self._clear_list, style="Secondary.TButton")
         self.clear_btn.pack(side=tk.LEFT)
 
         # --------------------------------------------------------------------
-        # Row 3: Settings Panel
+        # Row 3: Settings Panel Card
         # --------------------------------------------------------------------
-        settings_frame = ttk.LabelFrame(main_frame, text=" Settings for Selected File(s) ", padding="8")
-        settings_frame.pack(fill=tk.X, pady=(0, 8))
+        settings_card = ttk.LabelFrame(main_container, text=" Voice & Style Settings for Selected File(s) ", padding="10")
+        settings_card.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(settings_frame, text="Voice:").grid(row=0, column=0, padx=(0, 6), sticky=tk.W)
+        ttk.Label(settings_card, text="Voice:", style="Card.TLabel").grid(row=0, column=0, padx=(4, 6), sticky=tk.W)
         self.voice_var = tk.StringVar(value=self.last_applied_voice)
         self.voice_cb = ttk.Combobox(
-            settings_frame, textvariable=self.voice_var, values=VOICES, state="readonly", width=16
+            settings_card, textvariable=self.voice_var, values=VOICES, state="readonly", width=16
         )
         self.voice_cb.grid(row=0, column=1, padx=(0, 16), sticky=tk.W)
 
-        ttk.Label(settings_frame, text="Style:").grid(row=0, column=2, padx=(0, 6), sticky=tk.W)
+        ttk.Label(settings_card, text="Style:", style="Card.TLabel").grid(row=0, column=2, padx=(0, 6), sticky=tk.W)
         self.style_var = tk.StringVar(value=self.last_applied_style)
         self.style_cb = ttk.Combobox(
-            settings_frame, textvariable=self.style_var, values=list(STYLE_PRESETS.keys()), state="normal", width=28
+            settings_card, textvariable=self.style_var, values=list(STYLE_PRESETS.keys()), state="normal", width=28
         )
         self.style_cb.grid(row=0, column=3, padx=(0, 16), sticky=tk.W)
 
-        self.apply_btn = ttk.Button(settings_frame, text="Apply", command=self._apply_settings)
+        self.apply_btn = ttk.Button(settings_card, text="Apply to Selected", command=self._apply_settings, style="Secondary.TButton")
         self.apply_btn.grid(row=0, column=4, padx=(0, 6))
 
-        self.apply_all_btn = ttk.Button(settings_frame, text="Apply to all", command=self._apply_to_all)
+        self.apply_all_btn = ttk.Button(settings_card, text="Apply to All", command=self._apply_to_all, style="Secondary.TButton")
         self.apply_all_btn.grid(row=0, column=5)
 
         # --------------------------------------------------------------------
         # Row 4: Action & Progress Row
         # --------------------------------------------------------------------
-        action_frame = ttk.Frame(main_frame)
-        action_frame.pack(fill=tk.X, pady=(0, 8))
+        action_frame = ttk.Frame(main_container)
+        action_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.start_btn = ttk.Button(action_frame, text="Start Batch", command=self._start_batch)
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.start_btn = ttk.Button(action_frame, text="▶ Start Batch", command=self._start_batch, style="Primary.TButton")
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.stop_btn = ttk.Button(action_frame, text="Stop", command=self._stop_batch, state="disabled")
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self.stop_btn = ttk.Button(action_frame, text="■ Stop", command=self._stop_batch, state="disabled", style="Danger.TButton")
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 14))
 
-        self.progress_bar = ttk.Progressbar(action_frame, orient=tk.HORIZONTAL, mode="determinate")
-        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.progress_bar = ttk.Progressbar(action_frame, orient=tk.HORIZONTAL, mode="determinate", style="Horizontal.TProgressbar")
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
 
-        self.progress_label = ttk.Label(action_frame, text="Ready", width=22, anchor=tk.E)
+        self.progress_label = ttk.Label(action_frame, text="Ready", width=24, anchor=tk.E)
         self.progress_label.pack(side=tk.RIGHT)
 
         # --------------------------------------------------------------------
-        # Row 5: Activity Log
+        # Row 5: Activity Log Card
         # --------------------------------------------------------------------
-        log_frame = ttk.LabelFrame(main_frame, text=" Activity Log ", padding="6")
-        log_frame.pack(fill=tk.BOTH, expand=False)
+        log_card = ttk.LabelFrame(main_container, text=" Activity Log ", padding="8")
+        log_card.pack(fill=tk.BOTH, expand=False)
 
-        self.log_text = ScrolledText(log_frame, height=6, wrap=tk.WORD, state="disabled")
+        self.log_text = ScrolledText(
+            log_card,
+            height=6,
+            wrap=tk.WORD,
+            state="disabled",
+            bg=COLOR_INPUT_BG,
+            fg=COLOR_TEXT_PRIMARY,
+            insertbackground=COLOR_ACCENT_CYAN,
+            selectbackground=COLOR_ACCENT_BLUE,
+            selectforeground="#ffffff",
+            highlightbackground=COLOR_BORDER,
+            highlightcolor=COLOR_BORDER_FOCUS,
+            font=("Consolas", 9),
+            relief="flat",
+        )
+        self.log_text.tag_configure("time", foreground=COLOR_ACCENT_CYAN)
+        self.log_text.tag_configure("err", foreground=COLOR_DANGER)
+        self.log_text.tag_configure("ok", foreground=COLOR_SUCCESS)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
     # ------------------------------------------------------------------------
@@ -610,11 +823,9 @@ class TTSBatchApp:
             abs_path = os.path.abspath(path)
             base_name = os.path.basename(abs_path)
 
-            # Ignore Word temporary lock files starting with ~$
             if base_name.startswith("~$"):
                 continue
 
-            # Check legacy .doc format
             if abs_path.lower().endswith(".doc"):
                 messagebox.showwarning(
                     "Unsupported Format",
@@ -623,7 +834,6 @@ class TTSBatchApp:
                 )
                 continue
 
-            # Ignore duplicate files
             norm_path = os.path.normcase(abs_path)
             if norm_path in existing_paths:
                 continue
@@ -698,7 +908,6 @@ class TTSBatchApp:
         if self.is_processing:
             return
 
-        # 1. Validate API Key
         api_key = self.api_key_var.get().strip()
         is_mock = os.environ.get("TTS_MOCK") == "1"
         if not api_key and not is_mock:
@@ -706,18 +915,15 @@ class TTSBatchApp:
             self.api_entry.focus_set()
             return
 
-        # Save API Key to DPAPI storage
         if api_key:
             save_api_key(api_key)
 
-        # 2. Validate File List
         items = self.tree.get_children()
         if not items:
             messagebox.showwarning("Empty List", "Please add at least one .txt or .docx file to convert.")
             return
 
-        # 3. Validate File Existence
-        file_records: list[tuple[str, str, str, str]] = []  # (item_id, path, voice, style)
+        file_records: list[tuple[str, str, str, str]] = []
         file_paths = []
         for item in items:
             f_path = self.tree.set(item, "filepath")
@@ -729,7 +935,6 @@ class TTSBatchApp:
             file_records.append((item, f_path, f_voice, f_style))
             file_paths.append(f_path)
 
-        # 4. Check Output Path Collisions
         collisions = check_output_collisions(file_paths)
         if collisions:
             collision_details = []
@@ -743,7 +948,6 @@ class TTSBatchApp:
             messagebox.showerror("Output Path Collision", msg)
             return
 
-        # Prepare for background processing
         self.is_processing = True
         self.stop_event.clear()
         self.start_btn.configure(state="disabled")
@@ -758,7 +962,6 @@ class TTSBatchApp:
         self.progress_label.configure(text="Starting...")
         self.log("Starting batch processing...")
 
-        # Spawn worker thread
         worker = threading.Thread(
             target=self._worker_thread,
             args=(file_records, api_key),
@@ -785,7 +988,6 @@ class TTSBatchApp:
                 self.queue.put(("auth_error", f"Failed to initialize Gemini client: {exc}"))
                 return
 
-        # Pre-extract and chunk all files to calculate total chunks
         prepared_files: list[dict] = []
         total_chunks = 0
 
@@ -896,7 +1098,6 @@ class TTSBatchApp:
                     self.queue.put(("log", "Authentication failure detected. Halting remaining files."))
                 continue
 
-            # Encode all accumulated PCM to MP3
             try:
                 save_pcm_as_mp3(bytes(pcm_accumulator), detected_sample_rate, output_mp3)
                 file_size_kb = os.path.getsize(output_mp3) / 1024.0
@@ -916,7 +1117,6 @@ class TTSBatchApp:
     ) -> tuple[bytes, int, str | None]:
         """Fetch TTS audio for a single chunk with retry backoff (2s, 4s)."""
         if is_mock:
-            # 1 second of 24000Hz 16-bit mono silence (48,000 bytes)
             time.sleep(0.08)
             return b"\x00" * (DEFAULT_SAMPLE_RATE * 2), DEFAULT_SAMPLE_RATE, None
 
@@ -971,7 +1171,6 @@ class TTSBatchApp:
                 if self.stop_event.is_set():
                     return b"", DEFAULT_SAMPLE_RATE, "Operation stopped by user"
 
-                # Fail immediately on invalid key or permission errors (400, 401, 403)
                 if is_auth_or_invalid_key_error(exc):
                     return b"", DEFAULT_SAMPLE_RATE, f"Invalid API Key or Permission Error: {exc}"
 
@@ -1051,12 +1250,17 @@ class TTSBatchApp:
         """Append a message to the activity log text widget."""
         timestamp = time.strftime("[%H:%M:%S] ")
         self.log_text.configure(state="normal")
-        self.log_text.insert(tk.END, timestamp + message + "\n")
+        self.log_text.insert(tk.END, timestamp, "time")
+        if "error" in message.lower() or "failed" in message.lower():
+            self.log_text.insert(tk.END, message + "\n", "err")
+        elif "finished" in message.lower() or "completed" in message.lower():
+            self.log_text.insert(tk.END, message + "\n", "ok")
+        else:
+            self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state="disabled")
 
     def _on_close(self):
-        # Save API key upon exit
         key = self.api_key_var.get().strip()
         if key:
             save_api_key(key)
@@ -1069,20 +1273,9 @@ class TTSBatchApp:
 
 def main():
     root = tk.Tk()
-    # Apply modern ttk theme if available
-    try:
-        style = ttk.Style(root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        elif "clam" in style.theme_names():
-            style.theme_use("clam")
-    except Exception:
-        pass
-
     app = TTSBatchApp(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
-
