@@ -440,6 +440,54 @@ class TestCustomVoiceAndUI(unittest.TestCase):
             root.destroy()
 
 
+class TestModelFallback(unittest.TestCase):
+    def test_model_constants(self):
+        self.assertEqual(tts_gui.PRIMARY_MODEL, "gemini-3.8-flash-tts")
+        self.assertEqual(tts_gui.FALLBACK_MODEL, "gemini-3.8-flash-lite-tts")
+        self.assertEqual(tts_gui.MODEL_NAME, "gemini-3.8-flash-tts")
+
+    def test_fallback_on_quota_daily(self):
+        import tkinter as tk
+        from unittest.mock import MagicMock
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = tts_gui.TTSBatchApp(root)
+            self.assertEqual(app.active_model, tts_gui.PRIMARY_MODEL)
+
+            # Create a mock client that raises quota_daily on PRIMARY_MODEL, but succeeds on FALLBACK_MODEL
+            class MockClient:
+                def __init__(self):
+                    self.models = self
+
+                def generate_content_stream(self, model, contents, config):
+                    if model == tts_gui.PRIMARY_MODEL:
+                        raise APIError(429, {"error": {"code": 429, "message": "Quota exceeded for quota metric per day"}})
+                    chunk_mock = MagicMock()
+                    chunk_mock.parts = [MagicMock(inline_data=MagicMock(data=b"\x00" * 200, mime_type="audio/pcm"))]
+                    return [chunk_mock]
+
+            client = MockClient()
+            pcm, rate, err, was_rl, active_model = app._fetch_audio_chunk_with_retry(
+                client=client,
+                chunk_text="Test fallback chunk",
+                voice="Bodi",
+                clean_style="",
+                is_mock=False,
+                chunk_idx=1,
+                total_chunks=1,
+                active_model=tts_gui.PRIMARY_MODEL,
+            )
+
+            # Verify it automatically shifted to FALLBACK_MODEL and succeeded
+            self.assertEqual(active_model, tts_gui.FALLBACK_MODEL)
+            self.assertEqual(app.active_model, tts_gui.FALLBACK_MODEL)
+            self.assertIsNone(err)
+            self.assertGreater(len(pcm), 0)
+        finally:
+            root.destroy()
+
+
 class TestSelfTestFunction(unittest.TestCase):
     def test_run_selftest_passes(self):
         exit_code = run_selftest()

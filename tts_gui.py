@@ -43,7 +43,9 @@ from google.genai import errors
 APP_NAME = "Text to Speech Batch"
 APP_SUBTITLE = "AI Audio Studio"
 
-MODEL_NAME = "gemini-3.8-flash-tts"
+PRIMARY_MODEL = "gemini-3.8-flash-tts"
+FALLBACK_MODEL = "gemini-3.8-flash-lite-tts"
+MODEL_NAME = PRIMARY_MODEL
 MAX_CHARS = 3000
 MP3_BITRATE_KBPS = 64
 MP3_QUALITY = 2
@@ -640,6 +642,7 @@ class TTSBatchApp:
         self.root.configure(bg=COLOR_WINDOW_BG)
 
         # State
+        self.active_model = PRIMARY_MODEL
         self.last_applied_voice = VOICES[0]
         self.last_applied_style = DEFAULT_STYLE_LABEL
         self.is_processing = False
@@ -658,7 +661,7 @@ class TTSBatchApp:
         self._build_ui()
 
         # Initial greeting in the log
-        self.log(f"{APP_NAME} initialized. Ready for batch processing.", "ok")
+        self.log(f"{APP_NAME} initialized (Primary: {PRIMARY_MODEL}, Fallback: {FALLBACK_MODEL}). Ready for batch processing.", "ok")
 
         # Load persisted API key
         saved_key = load_api_key()
@@ -1628,6 +1631,8 @@ class TTSBatchApp:
         is_mock = os.environ.get("TTS_MOCK") == "1"
         client = None
 
+        active_model = getattr(self, "active_model", PRIMARY_MODEL)
+
         if is_mock:
             self.queue.put(("log", "[MOCK MODE] Network calls bypassed. Generating silence per chunk.", "warn"))
         else:
@@ -1637,7 +1642,11 @@ class TTSBatchApp:
                     api_key=api_key,
                     http_options=types.HttpOptions(timeout=180000),
                 )
-                self.queue.put(("log", f"Connected to Gemini API using model '{MODEL_NAME}'.", "ok"))
+                self.queue.put((
+                    "log",
+                    f"Connected to Gemini API. Active: '{active_model}', Fallback: '{FALLBACK_MODEL}'.",
+                    "ok",
+                ))
             except Exception as exc:
                 err_info = classify_error(exc)
                 self.queue.put(("auth_error", f"Failed to initialize Gemini API client: {err_info.user_message}"))
@@ -1795,12 +1804,12 @@ class TTSBatchApp:
                         self.queue.put(("item_status", item_id, f"Stopped ({chunks_completed_for_file}/{num_chunks} chunks)"))
                         break
 
-                    self.queue.put(("log", f"Sending chunk {idx}/{num_chunks} ({len(chunk):,} chars) to Gemini TTS...", "info"))
+                    self.queue.put(("log", f"Sending chunk {idx}/{num_chunks} ({len(chunk):,} chars) to Gemini TTS [{active_model}]...", "info"))
                     if clean_style:
                         self.queue.put(("log", f"  Applied vocal style metadata: \"{clean_style}\"", "sub"))
 
                     last_request_time = time.time()
-                    chunk_pcm, chunk_rate, err_info, was_rate_limited = self._fetch_audio_chunk_with_retry(
+                    chunk_pcm, chunk_rate, err_info, was_rate_limited, active_model = self._fetch_audio_chunk_with_retry(
                         client=client,
                         chunk_text=chunk,
                         voice=voice,
@@ -1808,6 +1817,7 @@ class TTSBatchApp:
                         is_mock=is_mock,
                         chunk_idx=idx,
                         total_chunks=num_chunks,
+                        active_model=active_model,
                     )
 
                     if was_rate_limited:
@@ -1891,11 +1901,12 @@ class TTSBatchApp:
         is_mock: bool,
         chunk_idx: int,
         total_chunks: int,
-    ) -> tuple[bytes, int, ErrorInfo | None, bool]:
-        """Fetch TTS audio for a single chunk with non-spoken vocal styling metadata and retry handling."""
+        active_model: str = PRIMARY_MODEL,
+    ) -> tuple[bytes, int, ErrorInfo | None, bool, str]:
+        """Fetch TTS audio for a single chunk with non-spoken vocal styling metadata, retry handling, and automatic model fallback."""
         if is_mock:
             time.sleep(0.08)
-            return b"\x00" * (DEFAULT_SAMPLE_RATE * 2), DEFAULT_SAMPLE_RATE, None, False
+            return b"\x00" * (DEFAULT_SAMPLE_RATE * 2), DEFAULT_SAMPLE_RATE, None, False, active_model
 
         rate_limit_sequence = [20.0, 40.0, 60.0, 60.0]
         transient_sequence = [2.0, 4.0]
@@ -1905,10 +1916,11 @@ class TTSBatchApp:
         rate_limit_attempt = 0
         transient_attempt = 0
         saw_rate_limit = False
+        current_model = active_model
 
         while True:
             if self.stop_event.is_set():
-                return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
+                return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit, current_model
 
             try:
                 # Isolate style instruction in speech_metadata so the model never reads it aloud as transcript
@@ -1937,10 +1949,10 @@ class TTSBatchApp:
                 detected_rate = DEFAULT_SAMPLE_RATE
 
                 for resp_chunk in client.models.generate_content_stream(
-                    model=MODEL_NAME, contents=contents, config=config
+                    model=current_model, contents=contents, config=config
                 ):
                     if self.stop_event.is_set():
-                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit, current_model
 
                     for p in (resp_chunk.parts or []):
                         if p.inline_data and p.inline_data.data:
@@ -1954,36 +1966,51 @@ class TTSBatchApp:
                 full_chunk_pcm = b"".join(pcm_chunks)
                 if not full_chunk_pcm:
                     raise RuntimeError("No audio data received from Gemini TTS API")
-                return full_chunk_pcm, detected_rate, None, saw_rate_limit
+                return full_chunk_pcm, detected_rate, None, saw_rate_limit, current_model
 
             except Exception as exc:
                 if self.stop_event.is_set():
-                    return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
+                    return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit, current_model
 
                 err_info = classify_error(exc)
 
-                # Halt immediately on auth, region, model_not_found, or daily quota
+                # Automatic fallback from PRIMARY_MODEL to FALLBACK_MODEL on daily quota exhaustion or model unavailability
+                if err_info.kind in ("quota_daily", "model_not_found") and current_model == PRIMARY_MODEL:
+                    reason = "Daily quota reached" if err_info.kind == "quota_daily" else "Model unavailable"
+                    self.queue.put((
+                        "log",
+                        f"{reason} on '{PRIMARY_MODEL}'. Automatically shifting to fallback model '{FALLBACK_MODEL}'...",
+                        "warn",
+                    ))
+                    current_model = FALLBACK_MODEL
+                    self.active_model = FALLBACK_MODEL
+                    rate_limit_attempt = 0
+                    transient_attempt = 0
+                    time.sleep(0.5)
+                    continue
+
+                # Halt immediately on auth, region, model_not_found, or daily quota (if fallback model also failed)
                 if err_info.kind in ("auth", "region", "model_not_found", "quota_daily"):
-                    return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit
+                    return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit, current_model
 
                 # Fail-fast without retry on client 400 bad_request (e.g. invalid voice name)
                 if err_info.kind == "bad_request":
-                    return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit
+                    return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit, current_model
 
                 # Handle 429 rate_limit
                 if err_info.kind == "rate_limit":
                     saw_rate_limit = True
                     rate_limit_attempt += 1
                     if rate_limit_attempt >= max_rate_limit_attempts:
-                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("rate_limit", f"Rate limit exceeded after {max_rate_limit_attempts} attempts: {exc}"), True
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("rate_limit", f"Rate limit exceeded after {max_rate_limit_attempts} attempts: {exc}"), True, current_model
 
                     delay = extract_retry_delay(exc, rate_limit_attempt - 1, rate_limit_sequence)
-                    self.queue.put(("log", f"Rate limit (429) on chunk {chunk_idx}/{total_chunks}. Waiting {delay:.0f}s before retry (attempt {rate_limit_attempt + 1}/{max_rate_limit_attempts})...", "warn"))
+                    self.queue.put(("log", f"Rate limit (429) on chunk {chunk_idx}/{total_chunks} [{current_model}]. Waiting {delay:.0f}s before retry (attempt {rate_limit_attempt + 1}/{max_rate_limit_attempts})...", "warn"))
 
                     slept = 0.0
                     while slept < delay:
                         if self.stop_event.is_set():
-                            return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), True
+                            return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), True, current_model
                         step = min(0.2, delay - slept)
                         time.sleep(step)
                         slept += step
@@ -1993,22 +2020,22 @@ class TTSBatchApp:
                 if err_info.kind == "transient":
                     transient_attempt += 1
                     if transient_attempt >= max_transient_attempts:
-                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("transient", f"Transient error failed after {max_transient_attempts} attempts: {exc}"), saw_rate_limit
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("transient", f"Transient error failed after {max_transient_attempts} attempts: {exc}"), saw_rate_limit, current_model
 
                     delay = transient_sequence[min(transient_attempt - 1, len(transient_sequence) - 1)]
-                    self.queue.put(("log", f"Transient error on chunk {chunk_idx}: {exc}. Retrying in {delay:.0f}s (attempt {transient_attempt + 1}/{max_transient_attempts})...", "warn"))
+                    self.queue.put(("log", f"Transient error on chunk {chunk_idx} [{current_model}]: {exc}. Retrying in {delay:.0f}s (attempt {transient_attempt + 1}/{max_transient_attempts})...", "warn"))
 
                     slept = 0.0
                     while slept < delay:
                         if self.stop_event.is_set():
-                            return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit
+                            return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit, current_model
                         step = min(0.2, delay - slept)
                         time.sleep(step)
                         slept += step
                     continue
 
                 # Any unclassified error: abort current file
-                return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit
+                return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit, current_model
 
     # ------------------------------------------------------------------------
     # Queue Processing & UI Dispatching
