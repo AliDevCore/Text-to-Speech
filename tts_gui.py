@@ -2007,6 +2007,16 @@ class TTSBatchApp:
 
     def _worker_thread(self, file_records: list[tuple[str, str, str, str]], pool: ApiKeyPool):
         """Sequential background processing worker with non-spoken styling, unique output naming, and caching."""
+        try:
+            self._worker_thread_internal(file_records, pool)
+        except Exception as fatal_exc:
+            import traceback
+            err_trace = traceback.format_exc()
+            self.queue.put(("log", f"FATAL WORKER ERROR: {fatal_exc}", "err"))
+            self.queue.put(("log", f"{err_trace}", "err"))
+            self.queue.put(("batch_finished", 0, len(file_records), 0, True))
+
+    def _worker_thread_internal(self, file_records: list[tuple[str, str, str, str]], pool: ApiKeyPool):
         is_mock = os.environ.get("TTS_MOCK") == "1"
 
         if is_mock:
@@ -2267,11 +2277,14 @@ class TTSBatchApp:
         chunk_idx: int,
         total_chunks: int,
         active_model: str = PRIMARY_MODEL,
+        pool: ApiKeyPool | None = None,
     ) -> tuple[bytes, int, ErrorInfo | None, bool, str]:
-        """Fetch TTS audio for a single chunk with non-spoken vocal styling metadata, retry handling, and automatic model fallback."""
-        if is_mock:
-            time.sleep(0.08)
-            return b"\x00" * (DEFAULT_SAMPLE_RATE * 2), DEFAULT_SAMPLE_RATE, None, False, active_model
+        """Fetch TTS audio for a single chunk with round-robin pool rotation, vocal styling metadata, retry handling, and automatic model fallback."""
+        if pool is None:
+            pool = ApiKeyPool(["standalone_key"])
+            if client is not None:
+                pool._clients["standalone_key"] = client
+            pool.active_model = active_model
 
         rate_limit_sequence = [20.0, 40.0, 60.0, 60.0]
         transient_sequence = [2.0, 4.0]
@@ -2281,14 +2294,29 @@ class TTSBatchApp:
         rate_limit_attempt = 0
         transient_attempt = 0
         saw_rate_limit = False
-        current_model = active_model
 
         while True:
             if self.stop_event.is_set():
-                return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit, current_model
+                return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit, pool.get_active_model()
+
+            candidate = pool.get_next_key_and_model()
+            if candidate is None:
+                return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("quota_daily", "Daily quota exhausted across all configured API keys on both primary and fallback models."), saw_rate_limit, pool.get_active_model()
+
+            current_api_key, current_model, key_idx = candidate
+            key_tag = f"Key #{key_idx}" if pool.total_count() > 1 else "API Key"
+
+            if is_mock:
+                time.sleep(0.08)
+                self.active_model = current_model
+                return b"\x00" * (DEFAULT_SAMPLE_RATE * 2), DEFAULT_SAMPLE_RATE, None, False, current_model
+
+            self.queue.put(("log", f"Sending chunk {chunk_idx}/{total_chunks} ({len(chunk_text):,} chars) to Gemini TTS using {key_tag} [{current_model}]...", "info"))
+            if clean_style:
+                self.queue.put(("log", f"  Applied vocal style metadata: \"{clean_style}\"", "sub"))
 
             try:
-                # Isolate style instruction in speech_metadata so the model never reads it aloud as transcript
+                active_client = pool.get_client(current_api_key)
                 speech_metadata = types.SpeechMetadata(style=clean_style) if clean_style else None
                 part = types.Part(
                     text=chunk_text,
@@ -2313,7 +2341,7 @@ class TTSBatchApp:
                 pcm_chunks: list[bytes] = []
                 detected_rate = DEFAULT_SAMPLE_RATE
 
-                for resp_chunk in client.models.generate_content_stream(
+                for resp_chunk in active_client.models.generate_content_stream(
                     model=current_model, contents=contents, config=config
                 ):
                     if self.stop_event.is_set():
@@ -2331,6 +2359,8 @@ class TTSBatchApp:
                 full_chunk_pcm = b"".join(pcm_chunks)
                 if not full_chunk_pcm:
                     raise RuntimeError("No audio data received from Gemini TTS API")
+
+                self.active_model = current_model
                 return full_chunk_pcm, detected_rate, None, saw_rate_limit, current_model
 
             except Exception as exc:
@@ -2340,22 +2370,45 @@ class TTSBatchApp:
                 err_info = classify_error(exc)
 
                 # Automatic fallback from PRIMARY_MODEL to FALLBACK_MODEL on daily quota exhaustion or model unavailability
-                if err_info.kind in ("quota_daily", "model_not_found") and current_model == PRIMARY_MODEL:
-                    reason = "Daily quota reached" if err_info.kind == "quota_daily" else "Model unavailable"
-                    self.queue.put((
-                        "log",
-                        f"{reason} on '{PRIMARY_MODEL}'. Automatically shifting to fallback model '{FALLBACK_MODEL}'...",
-                        "warn",
-                    ))
-                    current_model = FALLBACK_MODEL
-                    self.active_model = FALLBACK_MODEL
-                    rate_limit_attempt = 0
-                    transient_attempt = 0
-                    time.sleep(0.5)
+                if err_info.kind == "quota_daily":
+                    all_exhausted, notice = pool.mark_quota_daily(current_api_key, current_model)
+                    self.queue.put(("log", notice, "warn"))
+                    if all_exhausted and current_model == PRIMARY_MODEL:
+                        self.queue.put((
+                            "log",
+                            f"Daily quota reached on all keys for '{PRIMARY_MODEL}'. Automatically shifting to fallback model '{FALLBACK_MODEL}' across all keys...",
+                            "warn",
+                        ))
+                    self.active_model = pool.get_active_model()
+                    if pool.is_all_exhausted():
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("quota_daily", "Daily quota exhausted across all configured API keys on both primary and fallback models."), saw_rate_limit, pool.get_active_model()
+                    time.sleep(0.3)
                     continue
 
-                # Halt immediately on auth, region, model_not_found, or daily quota (if fallback model also failed)
-                if err_info.kind in ("auth", "region", "model_not_found", "quota_daily"):
+                if err_info.kind == "model_not_found":
+                    if current_model == PRIMARY_MODEL:
+                        self.queue.put((
+                            "log",
+                            f"Primary model '{PRIMARY_MODEL}' not found. Shifting all keys to fallback model '{FALLBACK_MODEL}'...",
+                            "warn",
+                        ))
+                        pool.shift_to_fallback()
+                        self.active_model = FALLBACK_MODEL
+                        time.sleep(0.3)
+                        continue
+                    else:
+                        return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit, current_model
+
+                if err_info.kind == "auth":
+                    pool.mark_invalid(current_api_key)
+                    self.queue.put(("log", f"{key_tag} authorization failed ({err_info.user_message}). Marking key as inactive.", "warn"))
+                    if pool.valid_count() == 0:
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("auth", f"All configured API keys failed authorization: {err_info.user_message}"), saw_rate_limit, current_model
+                    time.sleep(0.3)
+                    continue
+
+                # Halt immediately on region
+                if err_info.kind == "region":
                     return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit, current_model
 
                 # Fail-fast without retry on client 400 bad_request (e.g. invalid voice name)
