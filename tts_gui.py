@@ -424,8 +424,26 @@ class ApiKeyPool:
     def total_count(self) -> int:
         return len(self.keys)
 
+    def valid_count(self) -> int:
+        return len([k for k in self.keys if k not in self.invalid_keys])
+
     def get_active_model(self) -> str:
         return self.active_model
+
+    def shift_to_fallback(self) -> None:
+        self.active_model = FALLBACK_MODEL
+
+    def is_all_exhausted(self) -> bool:
+        valid_keys = [k for k in self.keys if k not in self.invalid_keys]
+        if not valid_keys:
+            return True
+        return all(k in self.exhausted_primary for k in valid_keys) and all(k in self.exhausted_fallback for k in valid_keys)
+
+    def key_index(self, api_key: str) -> int:
+        try:
+            return self.keys.index(api_key) + 1
+        except ValueError:
+            return 1
 
     def get_next_key_and_model(self) -> tuple[str, str, int] | None:
         """Return (api_key, model_name, key_index) for next request in round-robin order, or None if all exhausted."""
@@ -802,6 +820,7 @@ class TTSBatchApp:
         # State
         self.active_model = PRIMARY_MODEL
         self.api_keys_list: list[str] = []
+        self.api_key_var = tk.StringVar()
         self.last_applied_voice = VOICES[0]
         self.last_applied_style = DEFAULT_STYLE_LABEL
         self.is_processing = False
@@ -1014,39 +1033,7 @@ class TTSBatchApp:
         tag_lbl.pack(side=tk.LEFT)
 
         # --------------------------------------------------------------------
-        # Row 1: API Key Card
-        # --------------------------------------------------------------------
-        api_card = ttk.LabelFrame(main_container, text=" Gemini API Configuration ", padding="8")
-        api_card.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(api_card, text="Gemini API Key:", style="Card.TLabel").pack(side=tk.LEFT, padx=(4, 8))
-
-        self.api_key_var = tk.StringVar()
-        self.api_entry = ttk.Entry(api_card, textvariable=self.api_key_var, show="*")
-        self.api_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-
-        self.paste_btn = ttk.Button(
-            api_card, text="Paste", command=self._paste_api_key, style="Secondary.TButton"
-        )
-        self.paste_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.show_key_var = tk.BooleanVar(value=False)
-        self.show_check = ttk.Checkbutton(
-            api_card, text="Show", variable=self.show_key_var, command=self._toggle_show_key
-        )
-        self.show_check.configure(style="TCheckbutton")
-        self.show_check.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.manage_keys_btn = ttk.Button(
-            api_card,
-            text="Manage API Pool...",
-            command=self._open_api_manager,
-            style="Primary.TButton",
-        )
-        self.manage_keys_btn.pack(side=tk.LEFT, padx=(0, 4))
-
-        # --------------------------------------------------------------------
-        # Row 2: File Queue Card (Treeview with direct in-place editing)
+        # Row 1: File Queue Card (Treeview with direct in-place editing)
         # --------------------------------------------------------------------
         list_card = ttk.LabelFrame(
             main_container,
@@ -1144,7 +1131,7 @@ class TTSBatchApp:
         self.apply_all_btn.grid(row=0, column=7)
 
         # --------------------------------------------------------------------
-        # Row 4: Action & Progress Row
+        # Row 3: Action & Progress Row
         # --------------------------------------------------------------------
         action_frame = ttk.Frame(main_container)
         action_frame.pack(fill=tk.X, pady=(0, 8))
@@ -1155,11 +1142,19 @@ class TTSBatchApp:
         self.stop_btn = ttk.Button(action_frame, text="■ Stop", command=self._stop_batch, state="disabled", style="Danger.TButton")
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 14))
 
-        self.progress_bar = ttk.Progressbar(action_frame, orient=tk.HORIZONTAL, mode="determinate", style="Horizontal.TProgressbar")
-        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        self.manage_keys_btn = ttk.Button(
+            action_frame,
+            text="Manage API Pool...",
+            command=self._open_api_manager,
+            style="Primary.TButton",
+        )
+        self.manage_keys_btn.pack(side=tk.RIGHT, padx=(8, 0))
 
-        self.progress_label = ttk.Label(action_frame, text="Ready", width=24, anchor=tk.E)
-        self.progress_label.pack(side=tk.RIGHT)
+        self.progress_label = ttk.Label(action_frame, text="Ready", width=20, anchor=tk.E)
+        self.progress_label.pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.progress_bar = ttk.Progressbar(action_frame, orient=tk.HORIZONTAL, mode="determinate", style="Horizontal.TProgressbar")
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # --------------------------------------------------------------------
         # Row 5: Activity Log Card (Expansive, fully selectable & copyable console)
@@ -1208,7 +1203,6 @@ class TTSBatchApp:
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         # Attach universal clipboard handling (context menu & keycodes)
-        self._attach_universal_clipboard(self.api_entry)
         self._attach_universal_clipboard(self.voice_cb, on_change=self._on_panel_voice_change)
         self._attach_universal_clipboard(self.style_cb, on_change=self._on_panel_style_change)
         self._attach_log_clipboard(self.log_text)
@@ -1951,15 +1945,16 @@ class TTSBatchApp:
         if self.is_processing:
             return
 
-        api_key = self.api_key_var.get().strip()
+        pool_keys = [k for k in self.api_keys_list if k.strip()]
         is_mock = os.environ.get("TTS_MOCK") == "1"
-        if not api_key and not is_mock:
-            messagebox.showwarning("API Key Required", "Please enter a valid Gemini API Key before starting.")
-            self.api_entry.focus_set()
+        if not pool_keys and not is_mock:
+            open_now = messagebox.askyesno(
+                "API Keys Required",
+                "No Gemini API keys have been configured in the pool.\n\nWould you like to open the API Key Pool manager now to configure your key(s)?",
+            )
+            if open_now:
+                self._open_api_manager()
             return
-
-        if api_key:
-            save_api_key(api_key)
 
         items = self.tree.get_children()
         if not items:
@@ -1987,14 +1982,17 @@ class TTSBatchApp:
         self.apply_all_btn.configure(state="disabled")
         self.voice_paste_btn.configure(state="disabled")
         self.style_paste_btn.configure(state="disabled")
+        self.manage_keys_btn.configure(state="disabled")
 
         self.progress_bar.configure(value=0, maximum=100)
         self.progress_label.configure(text="Starting...")
         self.log(f"Starting batch conversion of {len(file_records)} file(s)...", "info")
 
+        pool = ApiKeyPool(pool_keys)
+
         worker = threading.Thread(
             target=self._worker_thread,
-            args=(file_records, api_key),
+            args=(file_records, pool),
             daemon=True,
         )
         worker.start()
@@ -2007,31 +2005,20 @@ class TTSBatchApp:
         self.log("Stop requested by user. Halting gracefully...", "warn")
         self.progress_label.configure(text="Stopping...")
 
-    def _worker_thread(self, file_records: list[tuple[str, str, str, str]], api_key: str):
+    def _worker_thread(self, file_records: list[tuple[str, str, str, str]], pool: ApiKeyPool):
         """Sequential background processing worker with non-spoken styling, unique output naming, and caching."""
         is_mock = os.environ.get("TTS_MOCK") == "1"
-        client = None
-
-        active_model = getattr(self, "active_model", PRIMARY_MODEL)
 
         if is_mock:
             self.queue.put(("log", "[MOCK MODE] Network calls bypassed. Generating silence per chunk.", "warn"))
         else:
-            self.queue.put(("log", "Connecting to Gemini API...", "info"))
-            try:
-                client = genai.Client(
-                    api_key=api_key,
-                    http_options=types.HttpOptions(timeout=180000),
-                )
-                self.queue.put((
-                    "log",
-                    f"Connected to Gemini API. Active: '{active_model}', Fallback: '{FALLBACK_MODEL}'.",
-                    "ok",
-                ))
-            except Exception as exc:
-                err_info = classify_error(exc)
-                self.queue.put(("auth_error", f"Failed to initialize Gemini API client: {err_info.user_message}"))
-                return
+            key_count = pool.total_count()
+            self.queue.put(("log", f"Initialized Gemini API key pool with {key_count} active key(s).", "info"))
+            self.queue.put((
+                "log",
+                f"Primary model: '{PRIMARY_MODEL}' | Fallback model: '{FALLBACK_MODEL}'.",
+                "ok",
+            ))
 
         # Pre-extract, inspect and chunk all files, assigning collision-free output paths
         prepared_files: list[dict] = []
@@ -2185,20 +2172,17 @@ class TTSBatchApp:
                         self.queue.put(("item_status", item_id, f"Stopped ({chunks_completed_for_file}/{num_chunks} chunks)"))
                         break
 
-                    self.queue.put(("log", f"Sending chunk {idx}/{num_chunks} ({len(chunk):,} chars) to Gemini TTS [{active_model}]...", "info"))
-                    if clean_style:
-                        self.queue.put(("log", f"  Applied vocal style metadata: \"{clean_style}\"", "sub"))
-
                     last_request_time = time.time()
                     chunk_pcm, chunk_rate, err_info, was_rate_limited, active_model = self._fetch_audio_chunk_with_retry(
-                        client=client,
+                        client=None,
                         chunk_text=chunk,
                         voice=voice,
                         clean_style=clean_style,
                         is_mock=is_mock,
                         chunk_idx=idx,
                         total_chunks=num_chunks,
-                        active_model=active_model,
+                        active_model=pool.get_active_model(),
+                        pool=pool,
                     )
 
                     if was_rate_limited:
@@ -2472,6 +2456,7 @@ class TTSBatchApp:
         self.apply_all_btn.configure(state="normal")
         self.voice_paste_btn.configure(state="normal")
         self.style_paste_btn.configure(state="normal")
+        self.manage_keys_btn.configure(state="normal")
 
         if was_stopped:
             self.progress_label.configure(text="Stopped")
@@ -2505,9 +2490,8 @@ class TTSBatchApp:
         self.log_text.configure(state="disabled")
 
     def _on_close(self):
-        key = self.api_key_var.get().strip()
-        if key:
-            save_api_key(key)
+        if self.api_keys_list:
+            save_api_keys(self.api_keys_list)
         self.root.destroy()
 
 
@@ -2571,6 +2555,20 @@ def run_selftest() -> int:
         record("Output collision avoidance logic", out_p.endswith("test1.mp3"))
     except Exception as exc:
         record("Output collision avoidance logic", False, str(exc))
+
+    try:
+        pool = ApiKeyPool(["keyA", "keyB"])
+        c1 = pool.get_next_key_and_model()
+        c2 = pool.get_next_key_and_model()
+        pool.mark_quota_daily("keyA", PRIMARY_MODEL)
+        pool.mark_quota_daily("keyB", PRIMARY_MODEL)
+        c3 = pool.get_next_key_and_model()
+        record(
+            "ApiKeyPool rotation and fallback shift",
+            c1[0] == "keyA" and c2[0] == "keyB" and c3[1] == FALLBACK_MODEL,
+        )
+    except Exception as exc:
+        record("ApiKeyPool rotation and fallback shift", False, str(exc))
 
     try:
         with open(log_path, "w", encoding="utf-8") as f:
