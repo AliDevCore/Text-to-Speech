@@ -26,6 +26,7 @@ from tts_gui import (
     ErrorInfo,
     classify_error,
     split_text_into_chunks,
+    verify_chunk_continuity,
     check_output_collisions,
     get_unique_output_path,
     extract_text,
@@ -103,6 +104,22 @@ class TestChunking(unittest.TestCase):
     def test_empty_and_whitespace_only(self):
         self.assertEqual(split_text_into_chunks(""), [])
         self.assertEqual(split_text_into_chunks("   \n\n  \t  "), [])
+
+    def test_verify_chunk_continuity(self):
+        sample = "Paragraph 1 with Persian text: یک دو سه چهار پنج.\n\nParagraph 2: شش هفت هشت نه ده."
+        chunks = split_text_into_chunks(sample, max_chars=40)
+        is_intact, diff = verify_chunk_continuity(sample, chunks)
+        self.assertTrue(is_intact)
+        self.assertEqual(diff, 0)
+
+        # Mismatch case
+        corrupt_chunks = chunks[:-1]
+        is_intact_corrupt, diff_corrupt = verify_chunk_continuity(sample, corrupt_chunks)
+        self.assertFalse(is_intact_corrupt)
+        self.assertGreater(diff_corrupt, 0)
+
+    def test_default_max_chars_is_1500(self):
+        self.assertEqual(MAX_CHARS, 1500)
 
 
 class TestErrorClassification(unittest.TestCase):

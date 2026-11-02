@@ -47,7 +47,7 @@ PRIMARY_MODEL = "gemini-3.8-flash-tts"
 FALLBACK_MODEL = "gemini-3.8-flash-lite-tts"
 MODEL_NAME = PRIMARY_MODEL
 MAX_API_KEYS = 10
-MAX_CHARS = 3000
+MAX_CHARS = 1500
 MP3_BITRATE_KBPS = 64
 MP3_QUALITY = 2
 DEFAULT_SAMPLE_RATE = 24000
@@ -727,6 +727,14 @@ def split_text_into_chunks(text: str, max_chars: int = MAX_CHARS) -> list[str]:
         chunks.append(current_chunk)
 
     return chunks
+
+
+def verify_chunk_continuity(original_text: str, chunks: list[str]) -> tuple[bool, int]:
+    """Verify that chunks reconstruct original_text with zero missing non-whitespace characters."""
+    clean_orig = re.sub(r"\s+", "", original_text or "")
+    clean_recon = re.sub(r"\s+", "", "".join(chunks or []))
+    diff = len(clean_orig) - len(clean_recon)
+    return (clean_orig == clean_recon, diff)
 
 
 # ============================================================================
@@ -2062,9 +2070,21 @@ class TTSBatchApp:
 
                 total_chunks += len(chunks)
                 self.queue.put(("log", f"  Chunked into {len(chunks)} piece(s) (limit: {MAX_CHARS} chars/chunk):", "sub"))
+
+                is_intact, dropped_count = verify_chunk_continuity(text, chunks)
+                if is_intact:
+                    self.queue.put(("log", f"  Text integrity verified: 100% of characters accounted for across all {len(chunks)} chunk(s) (0 dropped).", "sub"))
+                else:
+                    self.queue.put(("log", f"  Warning: Text integrity mismatch detected ({abs(dropped_count)} chars difference).", "warn"))
+
                 for c_idx, c in enumerate(chunks, start=1):
-                    preview = c[:45].replace("\n", " ") + ("..." if len(c) > 45 else "")
-                    self.queue.put(("log", f"    * Chunk {c_idx}/{len(chunks)}: {len(c):,} chars -> \"{preview}\"", "sub"))
+                    prefix = c[:35].replace("\n", " ").strip()
+                    suffix = c[-35:].replace("\n", " ").strip() if len(c) > 40 else ""
+                    if suffix:
+                        preview = f"\"{prefix}...\" ---> \"...{suffix}\""
+                    else:
+                        preview = f"\"{prefix}\""
+                    self.queue.put(("log", f"    * Chunk {c_idx}/{len(chunks)}: {len(c):,} chars -> {preview}", "sub"))
 
                 prepared_files.append({
                     "item_id": item_id,
@@ -2329,7 +2349,7 @@ class TTSBatchApp:
                     )
                 ]
                 config = types.GenerateContentConfig(
-                    temperature=1,
+                    temperature=0.4,
                     response_modalities=["audio"],
                     speech_config=types.SpeechConfig(
                         voice_config=types.VoiceConfig(
@@ -2340,12 +2360,18 @@ class TTSBatchApp:
 
                 pcm_chunks: list[bytes] = []
                 detected_rate = DEFAULT_SAMPLE_RATE
+                is_truncated = False
 
                 for resp_chunk in active_client.models.generate_content_stream(
                     model=current_model, contents=contents, config=config
                 ):
                     if self.stop_event.is_set():
                         return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("stopped", "Operation stopped by user"), saw_rate_limit, current_model
+
+                    for cand in getattr(resp_chunk, "candidates", None) or []:
+                        f_reason = getattr(cand, "finish_reason", None)
+                        if f_reason and "MAX_TOKENS" in str(f_reason).upper():
+                            is_truncated = True
 
                     for p in (resp_chunk.parts or []):
                         if p.inline_data and p.inline_data.data:
@@ -2355,6 +2381,9 @@ class TTSBatchApp:
                             pcm_chunks.append(raw)
                             if p.inline_data.mime_type:
                                 detected_rate = parse_sample_rate(p.inline_data.mime_type, detected_rate)
+
+                if is_truncated:
+                    self.queue.put(("log", "  Notice: Model output reached token limit for chunk. Consider smaller text chunks if speech sounded incomplete.", "warn"))
 
                 full_chunk_pcm = b"".join(pcm_chunks)
                 if not full_chunk_pcm:
