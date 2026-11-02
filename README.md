@@ -1,6 +1,6 @@
 # Text to Speech Batch
 
-A Windows desktop GUI application for batch-converting text files (`.txt`) and Word documents (`.docx`) to high-quality MP3 audio files using the Gemini TTS API (`gemini-3.8-flash-tts`).
+A Windows desktop GUI application for batch-converting text files (`.txt`) and Word documents (`.docx`) to high-quality MP3 audio files using the Gemini TTS API (`gemini-3.8-flash-tts` and `gemini-3.8-flash-lite-tts`).
 
 The deliverable is a standalone `.exe` (`TextToSpeechBatch.exe`) that runs on any Windows 10 or Windows 11 PC without requiring Python or external libraries (such as ffmpeg).
 
@@ -8,7 +8,21 @@ The deliverable is a standalone `.exe` (`TextToSpeechBatch.exe`) that runs on an
 
 ## Key Features
 
-- **Single Standalone Executable**: Bundles Python runtime, tkinter GUI, Google GenAI SDK, and the `lameenc` MP3 encoder without relying on external dependencies.
+- **Single Standalone Executable & Directory Distribution**:
+  - Bundles Python runtime, tkinter GUI, Google GenAI SDK, and the `lameenc` MP3 encoder without relying on external dependencies.
+  - GitHub Actions automatically packages a portable standalone single-file `.exe` release, while local builds provide a fast-launching directory distribution (`dist\TextToSpeechBatch`).
+- **Multi-Key API Pool (Up to 10 Keys) & Round-Robin Rotation**:
+  - Define up to 10 Gemini API keys in the "Manage API Pool..." modal window.
+  - Chunks rotate across all configured keys in round-robin order to balance quota and rate limits.
+  - Convenient bulk management: individual Paste/Clear buttons, show/mask toggle, and a "Paste Multi-line (Auto-fill)" button to paste an entire list of keys from the clipboard at once.
+  - All keys are securely encrypted on disk using Windows DPAPI (`CryptProtectData`/`CryptUnprotectData`).
+- **Two-Stage Automatic Model Fallback (`gemini-3.8-flash-tts` -> `gemini-3.8-flash-lite-tts`)**:
+  - **Stage 1**: Chunks execute round-robin across all active API keys using `gemini-3.8-flash-tts`.
+  - **Per-Key Failover**: If a key encounters `quota_daily` (429 per-day quota), it is marked as exhausted for that model and the chunk immediately shifts to the next available key.
+  - **Stage 2**: Once all keys exhaust quota on `gemini-3.8-flash-tts`, the system automatically shifts to `gemini-3.8-flash-lite-tts` across all keys in the pool without stopping the batch.
+  - Halts the queue only when all keys are completely exhausted on both models.
+- **Collision-Free Output File Naming**:
+  - Automatically detects existing `.mp3` files in the target directory and assigns unique names (e.g., `input1.mp3`, `input2.mp3`) instead of overwriting existing audio files.
 - **Structured Error Classification**:
   - Differentiates `auth` (401, 403 `PERMISSION_DENIED`), `region` (400 `FAILED_PRECONDITION` location unsupported), `model_not_found` (404), `quota_daily` (429 per-day), `rate_limit` (429 per-minute), `bad_request` (400 invalid argument/voice), and `transient` (5xx, timeouts, connection resets).
   - Fatal account/environment errors (`auth`, `region`, `model_not_found`, `quota_daily`) halt the batch cleanly; single-file errors (`bad_request`) fail only the offending file while continuing the rest of the queue.
@@ -31,12 +45,12 @@ The deliverable is a standalone `.exe` (`TextToSpeechBatch.exe`) that runs on an
   - Stopping and restarting resumes previously completed chunks instantly from cache without re-requesting the API.
   - Injects `0.3s` silence between chunks of the same file.
   - File cache is automatically cleaned upon successful MP3 generation, and orphaned caches older than 7 days are pruned on launch.
-- **Responsive In-Place Grid Editing**:
-  - Click or double-click the Voice or Style column directly in the file table to change settings per file.
-  - Settings panel comboboxes automatically apply to selected files on selection or Enter.
-  - Universal clipboard support (right-click context menu and Ctrl+V / Keycode 86 across all keyboard layouts).
+- **Fully Editable Voice & Style with Universal Clipboard**:
+  - Both Voice and Style comboboxes allow free typing and pasting (e.g. custom voices like "Zali", or custom prompt styles).
+  - Dedicated Paste buttons and full clipboard keyboard shortcuts (`Ctrl+V`, `Shift+Insert`, keycode 86) across all keyboard layouts.
+  - Click or double-click the Voice or Style column directly in the file table to edit in-place.
 - **Built-in CLI Self-Test**:
-  - Run `TextToSpeechBatch.exe --selftest` to verify DPAPI encryption, LAME encoder, docx parser, chunking, and error classification in headless mode.
+  - Run `TextToSpeechBatch.exe --selftest` to verify DPAPI encryption, LAME encoder, docx parser, chunking, pool rotation, and error classification in headless mode.
 
 ---
 

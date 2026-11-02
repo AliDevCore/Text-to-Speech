@@ -40,6 +40,12 @@ from tts_gui import (
     unprotect_data,
     get_file_cache_dir,
     run_selftest,
+    ApiKeyPool,
+    save_api_keys,
+    load_api_keys,
+    MAX_API_KEYS,
+    PRIMARY_MODEL,
+    FALLBACK_MODEL,
 )
 
 
@@ -486,6 +492,99 @@ class TestModelFallback(unittest.TestCase):
             self.assertGreater(len(pcm), 0)
         finally:
             root.destroy()
+
+
+class TestApiKeyPoolAndRotation(unittest.TestCase):
+    def test_pool_init_dedup_and_max_keys(self):
+        keys = ["k1", "k2", "k1", "k3", "  k4  "] + [f"extra_{i}" for i in range(10)]
+        pool = ApiKeyPool(keys)
+        self.assertEqual(pool.total_count(), MAX_API_KEYS)
+        self.assertEqual(pool.keys[0], "k1")
+        self.assertEqual(pool.keys[1], "k2")
+        self.assertEqual(pool.keys[2], "k3")
+        self.assertEqual(pool.keys[3], "k4")
+
+    def test_round_robin_rotation_primary_model(self):
+        keys = ["key1", "key2", "key3"]
+        pool = ApiKeyPool(keys)
+
+        c1 = pool.get_next_key_and_model()
+        c2 = pool.get_next_key_and_model()
+        c3 = pool.get_next_key_and_model()
+        c4 = pool.get_next_key_and_model()
+
+        self.assertEqual(c1, ("key1", PRIMARY_MODEL, 1))
+        self.assertEqual(c2, ("key2", PRIMARY_MODEL, 2))
+        self.assertEqual(c3, ("key3", PRIMARY_MODEL, 3))
+        self.assertEqual(c4, ("key1", PRIMARY_MODEL, 1))
+
+    def test_single_key_exhaustion_on_primary_model(self):
+        keys = ["keyA", "keyB", "keyC"]
+        pool = ApiKeyPool(keys)
+
+        all_exhausted, notice = pool.mark_quota_daily("keyB", PRIMARY_MODEL)
+        self.assertFalse(all_exhausted)
+        self.assertEqual(pool.get_active_model(), PRIMARY_MODEL)
+
+        results = [pool.get_next_key_and_model()[0] for _ in range(4)]
+        self.assertNotIn("keyB", results)
+        self.assertIn("keyA", results)
+        self.assertIn("keyC", results)
+
+    def test_all_keys_exhaustion_shifts_to_fallback_model(self):
+        keys = ["key1", "key2"]
+        pool = ApiKeyPool(keys)
+
+        all_ex1, _ = pool.mark_quota_daily("key1", PRIMARY_MODEL)
+        self.assertFalse(all_ex1)
+
+        all_ex2, _ = pool.mark_quota_daily("key2", PRIMARY_MODEL)
+        self.assertTrue(all_ex2)
+        self.assertEqual(pool.get_active_model(), FALLBACK_MODEL)
+
+        c1 = pool.get_next_key_and_model()
+        c2 = pool.get_next_key_and_model()
+        c3 = pool.get_next_key_and_model()
+
+        self.assertEqual(c1, ("key1", FALLBACK_MODEL, 1))
+        self.assertEqual(c2, ("key2", FALLBACK_MODEL, 2))
+        self.assertEqual(c3, ("key1", FALLBACK_MODEL, 1))
+
+    def test_both_models_exhausted_returns_none(self):
+        keys = ["k1"]
+        pool = ApiKeyPool(keys)
+
+        pool.mark_quota_daily("k1", PRIMARY_MODEL)
+        self.assertEqual(pool.get_active_model(), FALLBACK_MODEL)
+
+        all_ex, _ = pool.mark_quota_daily("k1", FALLBACK_MODEL)
+        self.assertTrue(all_ex)
+        self.assertTrue(pool.is_all_exhausted())
+        self.assertIsNone(pool.get_next_key_and_model())
+
+    def test_invalid_key_filtered_out(self):
+        keys = ["goodKey1", "badKey", "goodKey2"]
+        pool = ApiKeyPool(keys)
+        pool.mark_invalid("badKey")
+
+        self.assertEqual(pool.valid_count(), 2)
+        for _ in range(6):
+            res = pool.get_next_key_and_model()
+            self.assertIsNotNone(res)
+            key, model, _ = res
+            self.assertNotEqual(key, "badKey")
+            self.assertIn(key, ["goodKey1", "goodKey2"])
+
+    def test_save_and_load_api_keys_roundtrip(self):
+        test_keys = [f"AIzaSyTestKey_{i:02d}" for i in range(1, 11)]
+        orig_keys = load_api_keys()
+        try:
+            saved = save_api_keys(test_keys)
+            self.assertTrue(saved)
+            loaded = load_api_keys()
+            self.assertEqual(loaded, test_keys)
+        finally:
+            save_api_keys(orig_keys)
 
 
 class TestSelfTestFunction(unittest.TestCase):

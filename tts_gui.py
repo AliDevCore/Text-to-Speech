@@ -46,6 +46,7 @@ APP_SUBTITLE = "AI Audio Studio"
 PRIMARY_MODEL = "gemini-3.8-flash-tts"
 FALLBACK_MODEL = "gemini-3.8-flash-lite-tts"
 MODEL_NAME = PRIMARY_MODEL
+MAX_API_KEYS = 10
 MAX_CHARS = 3000
 MP3_BITRATE_KBPS = 64
 MP3_QUALITY = 2
@@ -173,19 +174,25 @@ def get_config_path() -> str:
     return os.path.join(dir_path, "config.json")
 
 
-def save_api_key(key: str) -> bool:
-    """Save the API key securely with DPAPI, falling back to plain storage."""
+def save_api_keys(keys: list[str]) -> bool:
+    """Save up to 10 API keys securely with DPAPI, falling back to plain storage."""
     config_path = get_config_path()
-    trimmed = key.strip()
-    data_to_store = {"api_key": "", "encrypted": False}
+    cleaned = [k.strip() for k in keys if k and k.strip()][:MAX_API_KEYS]
 
-    if trimmed:
+    stored_keys = []
+    for k in cleaned:
         try:
-            encrypted_bytes = protect_data(trimmed.encode("utf-8"))
+            encrypted_bytes = protect_data(k.encode("utf-8"))
             b64_str = base64.b64encode(encrypted_bytes).decode("ascii")
-            data_to_store = {"api_key": b64_str, "encrypted": True}
+            stored_keys.append({"key": b64_str, "encrypted": True})
         except Exception:
-            data_to_store = {"api_key": trimmed, "encrypted": False}
+            stored_keys.append({"key": k, "encrypted": False})
+
+    data_to_store = {
+        "api_keys": stored_keys,
+        "api_key": stored_keys[0]["key"] if stored_keys else "",
+        "encrypted": stored_keys[0]["encrypted"] if stored_keys else False,
+    }
 
     try:
         with open(config_path, "w", encoding="utf-8") as f:
@@ -195,24 +202,71 @@ def save_api_key(key: str) -> bool:
         return False
 
 
-def load_api_key() -> str:
-    """Load the API key from config.json, decrypting if encrypted."""
+def load_api_keys() -> list[str]:
+    """Load up to 10 API keys from config.json, decrypting if encrypted."""
     config_path = get_config_path()
     if not os.path.isfile(config_path):
-        return ""
+        return []
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        raw_key = data.get("api_key", "")
-        if not raw_key:
-            return ""
-        if data.get("encrypted", False):
-            cipher_bytes = base64.b64decode(raw_key.encode("ascii"))
-            decrypted_bytes = unprotect_data(cipher_bytes)
-            return decrypted_bytes.decode("utf-8")
-        return raw_key
+
+        keys: list[str] = []
+        if "api_keys" in data and isinstance(data["api_keys"], list):
+            for item in data["api_keys"]:
+                if isinstance(item, dict):
+                    raw_k = item.get("key", "")
+                    if not raw_k:
+                        continue
+                    if item.get("encrypted", False):
+                        try:
+                            cipher_bytes = base64.b64decode(raw_k.encode("ascii"))
+                            decrypted_bytes = unprotect_data(cipher_bytes)
+                            keys.append(decrypted_bytes.decode("utf-8"))
+                        except Exception:
+                            keys.append(raw_k)
+                    else:
+                        keys.append(raw_k)
+                elif isinstance(item, str) and item.strip():
+                    keys.append(item.strip())
+
+        # Fallback to single key if api_keys was empty
+        if not keys:
+            raw_key = data.get("api_key", "")
+            if raw_key:
+                if data.get("encrypted", False):
+                    try:
+                        cipher_bytes = base64.b64decode(raw_key.encode("ascii"))
+                        decrypted_bytes = unprotect_data(cipher_bytes)
+                        keys.append(decrypted_bytes.decode("utf-8"))
+                    except Exception:
+                        keys.append(raw_key)
+                else:
+                    keys.append(raw_key)
+
+        seen = set()
+        deduped = []
+        for k in keys:
+            cl = k.strip()
+            if cl and cl not in seen:
+                seen.add(cl)
+                deduped.append(cl)
+                if len(deduped) >= MAX_API_KEYS:
+                    break
+        return deduped
     except Exception:
-        return ""
+        return []
+
+
+def save_api_key(key: str) -> bool:
+    """Save single API key for backwards compatibility."""
+    return save_api_keys([key] if key.strip() else [])
+
+
+def load_api_key() -> str:
+    """Load primary API key for backwards compatibility."""
+    keys = load_api_keys()
+    return keys[0] if keys else ""
 
 
 # ============================================================================
@@ -329,6 +383,110 @@ def extract_retry_delay(exc: Exception, attempt: int, default_sequence: list[flo
     if attempt < len(default_sequence):
         return default_sequence[attempt]
     return default_sequence[-1]
+
+
+# ============================================================================
+# API Key Pool & Round-Robin Rotation
+# ============================================================================
+
+class ApiKeyPool:
+    """Manages round-robin rotation and per-model daily quota tracking across up to 10 Gemini API keys."""
+
+    def __init__(self, keys: list[str]):
+        seen = set()
+        deduped = []
+        for k in keys:
+            cl = k.strip()
+            if cl and cl not in seen:
+                seen.add(cl)
+                deduped.append(cl)
+                if len(deduped) >= MAX_API_KEYS:
+                    break
+        self.keys: list[str] = deduped
+        self.current_idx: int = 0
+        self.exhausted_primary: set[str] = set()
+        self.exhausted_fallback: set[str] = set()
+        self.invalid_keys: set[str] = set()
+        self.active_model: str = PRIMARY_MODEL
+        self._clients: dict[str, genai.Client] = {}
+
+    def get_client(self, api_key: str) -> genai.Client:
+        if api_key not in self._clients:
+            self._clients[api_key] = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=180000),
+            )
+        return self._clients[api_key]
+
+    def has_keys(self) -> bool:
+        return len(self.keys) > 0
+
+    def total_count(self) -> int:
+        return len(self.keys)
+
+    def get_active_model(self) -> str:
+        return self.active_model
+
+    def get_next_key_and_model(self) -> tuple[str, str, int] | None:
+        """Return (api_key, model_name, key_index) for next request in round-robin order, or None if all exhausted."""
+        valid_keys = [k for k in self.keys if k not in self.invalid_keys]
+        if not valid_keys:
+            return None
+
+        # Stage 1: Round-robin across keys for PRIMARY_MODEL
+        if self.active_model == PRIMARY_MODEL:
+            primary_candidates = [k for k in valid_keys if k not in self.exhausted_primary]
+            if primary_candidates:
+                for _ in range(len(self.keys)):
+                    candidate = self.keys[self.current_idx % len(self.keys)]
+                    self.current_idx = (self.current_idx + 1) % len(self.keys)
+                    if candidate in primary_candidates:
+                        idx = self.keys.index(candidate) + 1
+                        return candidate, PRIMARY_MODEL, idx
+
+            # All valid keys exhausted for PRIMARY_MODEL -> shift to FALLBACK_MODEL!
+            self.active_model = FALLBACK_MODEL
+
+        # Stage 2: Round-robin across keys for FALLBACK_MODEL
+        if self.active_model == FALLBACK_MODEL:
+            fallback_candidates = [k for k in valid_keys if k not in self.exhausted_fallback]
+            if fallback_candidates:
+                for _ in range(len(self.keys)):
+                    candidate = self.keys[self.current_idx % len(self.keys)]
+                    self.current_idx = (self.current_idx + 1) % len(self.keys)
+                    if candidate in fallback_candidates:
+                        idx = self.keys.index(candidate) + 1
+                        return candidate, FALLBACK_MODEL, idx
+
+        # All keys exhausted on both models!
+        return None
+
+    def mark_quota_daily(self, api_key: str, model_name: str) -> tuple[bool, str]:
+        """Mark daily quota exhausted for an API key on a model.
+        
+        Returns:
+            (all_keys_exhausted_on_this_model, log_message)
+        """
+        valid_keys = [k for k in self.keys if k not in self.invalid_keys]
+        key_num = self.keys.index(api_key) + 1 if api_key in self.keys else 1
+
+        if model_name == PRIMARY_MODEL:
+            self.exhausted_primary.add(api_key)
+            all_primary = all(k in self.exhausted_primary for k in valid_keys)
+            if all_primary:
+                self.active_model = FALLBACK_MODEL
+                return True, f"Daily quota exhausted across all {len(valid_keys)} API key(s) on primary model '{PRIMARY_MODEL}'."
+            return False, f"API key #{key_num} exhausted daily quota for '{PRIMARY_MODEL}'. Shifting to next key..."
+        else:
+            self.exhausted_fallback.add(api_key)
+            all_fallback = all(k in self.exhausted_fallback for k in valid_keys)
+            if all_fallback:
+                return True, f"Daily quota exhausted across all {len(valid_keys)} API key(s) on fallback model '{FALLBACK_MODEL}'."
+            return False, f"API key #{key_num} exhausted daily quota for '{FALLBACK_MODEL}'. Shifting to next key..."
+
+    def mark_invalid(self, api_key: str):
+        """Mark an API key as invalid (e.g. auth error)."""
+        self.invalid_keys.add(api_key)
 
 
 # ============================================================================
@@ -643,6 +801,7 @@ class TTSBatchApp:
 
         # State
         self.active_model = PRIMARY_MODEL
+        self.api_keys_list: list[str] = []
         self.last_applied_voice = VOICES[0]
         self.last_applied_style = DEFAULT_STYLE_LABEL
         self.is_processing = False
@@ -663,11 +822,13 @@ class TTSBatchApp:
         # Initial greeting in the log
         self.log(f"{APP_NAME} initialized (Primary: {PRIMARY_MODEL}, Fallback: {FALLBACK_MODEL}). Ready for batch processing.", "ok")
 
-        # Load persisted API key
-        saved_key = load_api_key()
-        if saved_key:
-            self.api_key_var.set(saved_key)
-            self.log("Loaded saved API key from Windows DPAPI encrypted storage.", "ok")
+        # Load persisted API keys (up to 10)
+        self.api_keys_list = load_api_keys()
+        if self.api_keys_list:
+            self.api_key_var.set(self.api_keys_list[0])
+            count = len(self.api_keys_list)
+            self.manage_keys_btn.configure(text=f"Manage Pool ({count} active)")
+            self.log(f"Loaded {count} saved API key(s) in pool from Windows DPAPI encrypted storage.", "ok")
 
         # Start queue polling
         self.root.after(100, self._process_queue)
@@ -874,7 +1035,15 @@ class TTSBatchApp:
             api_card, text="Show", variable=self.show_key_var, command=self._toggle_show_key
         )
         self.show_check.configure(style="TCheckbutton")
-        self.show_check.pack(side=tk.LEFT, padx=(0, 4))
+        self.show_check.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.manage_keys_btn = ttk.Button(
+            api_card,
+            text="Manage API Pool...",
+            command=self._open_api_manager,
+            style="Primary.TButton",
+        )
+        self.manage_keys_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         # --------------------------------------------------------------------
         # Row 2: File Queue Card (Treeview with direct in-place editing)
@@ -1197,11 +1366,223 @@ class TTSBatchApp:
     # Clipboard & UI Handlers
     # ------------------------------------------------------------------------
 
+    def _open_api_manager(self):
+        """Open the API Key Pool manager dialog to configure up to 10 Gemini API keys."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Gemini API Keys Pool — {APP_SUBTITLE}")
+        dialog.geometry("720x620")
+        dialog.minsize(640, 500)
+        dialog.configure(bg=COLOR_WINDOW_BG)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Header Frame
+        header_frame = ttk.Frame(dialog, padding="14")
+        header_frame.pack(fill=tk.X)
+
+        title_lbl = ttk.Label(
+            header_frame,
+            text="Gemini API Key Pool (Up to 10 Keys)",
+            font=("Segoe UI", 12, "bold"),
+            foreground=COLOR_ACCENT_CYAN,
+        )
+        title_lbl.pack(anchor=tk.W, pady=(0, 4))
+
+        info_text = (
+            "Define up to 10 Gemini API keys for seamless batch processing:\n"
+            "• Stage 1: The engine rotates requests across all active keys in round-robin order using 'gemini-3.8-flash-tts'.\n"
+            "• Stage 2: When daily quota is reached on all keys, it automatically shifts to 'gemini-3.8-flash-lite-tts' across all keys."
+        )
+        info_lbl = ttk.Label(
+            header_frame,
+            text=info_text,
+            font=("Segoe UI", 9),
+            foreground=COLOR_TEXT_SECONDARY,
+            justify=tk.LEFT,
+        )
+        info_lbl.pack(anchor=tk.W)
+
+        # Show/Hide Checkbox
+        show_all_var = tk.BooleanVar(value=False)
+        show_check = ttk.Checkbutton(
+            header_frame,
+            text="Show API Keys",
+            variable=show_all_var,
+        )
+        show_check.configure(style="TCheckbutton")
+        show_check.pack(anchor=tk.E, pady=(4, 0))
+
+        # Scrollable Canvas container for keys
+        list_container = ttk.Frame(dialog, padding="14")
+        list_container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(list_container, bg=COLOR_CARD_BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas, style="Card.TFrame", padding="8")
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+        def on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+
+        canvas.bind("<Configure>", on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        key_vars: list[tk.StringVar] = []
+        key_entries: list[ttk.Entry] = []
+
+        existing_keys = list(self.api_keys_list)
+        cur_ent = self.api_key_var.get().strip()
+        if cur_ent and cur_ent not in existing_keys:
+            existing_keys.insert(0, cur_ent)
+
+        def update_show_mask():
+            mask_char = "" if show_all_var.get() else "*"
+            for ent in key_entries:
+                ent.configure(show=mask_char)
+
+        show_check.configure(command=update_show_mask)
+
+        # Create 10 numbered slots
+        for i in range(MAX_API_KEYS):
+            row_frame = ttk.Frame(scrollable_frame, style="Card.TFrame", padding="3")
+            row_frame.pack(fill=tk.X, pady=2)
+
+            lbl = ttk.Label(
+                row_frame,
+                text=f"Key #{i+1:2d}:",
+                width=8,
+                font=("Segoe UI", 9, "bold"),
+                style="Card.TLabel",
+            )
+            lbl.pack(side=tk.LEFT, padx=(4, 6))
+
+            initial_val = existing_keys[i] if i < len(existing_keys) else ""
+            var = tk.StringVar(value=initial_val)
+            key_vars.append(var)
+
+            ent = ttk.Entry(row_frame, textvariable=var, show="*" if not show_all_var.get() else "")
+            ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+            key_entries.append(ent)
+            self._attach_universal_clipboard(ent)
+
+            def make_paste_fn(target_var=var):
+                def fn():
+                    try:
+                        clip = dialog.clipboard_get().strip()
+                        if clip:
+                            first_line = clip.splitlines()[0].strip()
+                            target_var.set(first_line)
+                    except Exception:
+                        pass
+                return fn
+
+            paste_btn = ttk.Button(row_frame, text="Paste", command=make_paste_fn(), style="Secondary.TButton")
+            paste_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+            def make_clear_fn(target_var=var):
+                def fn():
+                    target_var.set("")
+                return fn
+
+            clr_btn = ttk.Button(row_frame, text="Clear", command=make_clear_fn(), style="Secondary.TButton")
+            clr_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        # Bottom Actions Bar
+        bottom_bar = ttk.Frame(dialog, padding="14")
+        bottom_bar.pack(fill=tk.X)
+
+        def paste_multiline():
+            try:
+                clip = dialog.clipboard_get()
+                lines = [line.strip() for line in clip.splitlines() if line.strip()]
+                if not lines:
+                    messagebox.showinfo("Clipboard Empty", "The clipboard does not contain any text lines.")
+                    return
+                for i in range(MAX_API_KEYS):
+                    if i < len(lines):
+                        key_vars[i].set(lines[i])
+                    else:
+                        key_vars[i].set("")
+            except Exception as exc:
+                messagebox.showinfo("Clipboard Notice", f"Unable to read clipboard: {exc}")
+
+        paste_multi_btn = ttk.Button(
+            bottom_bar,
+            text="Paste Multi-line (Auto-fill)",
+            command=paste_multiline,
+            style="Secondary.TButton",
+        )
+        paste_multi_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        def clear_all_dialog():
+            for v in key_vars:
+                v.set("")
+
+        clear_all_dialog_btn = ttk.Button(
+            bottom_bar,
+            text="Clear All",
+            command=clear_all_dialog,
+            style="Secondary.TButton",
+        )
+        clear_all_dialog_btn.pack(side=tk.LEFT)
+
+        def save_and_close():
+            non_empty = [v.get().strip() for v in key_vars if v.get().strip()]
+            seen_keys = set()
+            clean_keys = []
+            for k in non_empty:
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    clean_keys.append(k)
+
+            save_api_keys(clean_keys)
+            self.api_keys_list = clean_keys
+            if clean_keys:
+                self.api_key_var.set(clean_keys[0])
+                count = len(clean_keys)
+                self.manage_keys_btn.configure(text=f"Manage Pool ({count} active)")
+                self.log(f"Configured {count} Gemini API key(s) in round-robin pool.", "ok")
+            else:
+                self.api_key_var.set("")
+                self.manage_keys_btn.configure(text="Manage API Pool...")
+                self.log("Cleared all API keys from pool.", "info")
+
+            dialog.destroy()
+
+        save_btn = ttk.Button(
+            bottom_bar,
+            text="Save & Apply Pool",
+            command=save_and_close,
+            style="Primary.TButton",
+        )
+        save_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        cancel_btn = ttk.Button(
+            bottom_bar,
+            text="Cancel",
+            command=dialog.destroy,
+            style="Secondary.TButton",
+        )
+        cancel_btn.pack(side=tk.RIGHT)
+
     def _paste_api_key(self):
         try:
             clip = self.root.clipboard_get().strip()
             if clip:
-                self.api_key_var.set(clip)
+                first_line = clip.splitlines()[0].strip()
+                self.api_key_var.set(first_line)
+                if first_line and first_line not in self.api_keys_list:
+                    self.api_keys_list.insert(0, first_line)
+                    save_api_keys(self.api_keys_list)
+                    self.manage_keys_btn.configure(text=f"Manage Pool ({len(self.api_keys_list)} active)")
                 self.log("Pasted API key from clipboard.", "ok")
             else:
                 messagebox.showinfo("Clipboard Empty", "The clipboard does not contain any text.")
