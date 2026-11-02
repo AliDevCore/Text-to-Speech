@@ -393,6 +393,53 @@ class TestAudioAndMockPipeline(unittest.TestCase):
             self.assertGreater(os.path.getsize(out_mp3), 100)
 
 
+class TestCustomVoiceAndUI(unittest.TestCase):
+    def test_custom_voice_config_generation(self):
+        # Verify custom voice string such as "Zali" can be passed to VoiceConfig
+        from google.genai import types
+        custom_voice = "Zali"
+        voice_cfg = types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=custom_voice)
+        )
+        self.assertEqual(voice_cfg.prebuilt_voice_config.voice_name, "Zali")
+
+    def test_tts_batch_app_voice_and_style_editable(self):
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = tts_gui.TTSBatchApp(root)
+            # Voice combobox must be normal (editable), not readonly
+            self.assertEqual(str(app.voice_cb.cget("state")), "normal")
+            # Style combobox must be normal (editable)
+            self.assertEqual(str(app.style_cb.cget("state")), "normal")
+
+            # Dedicated Paste buttons must exist
+            self.assertTrue(hasattr(app, "voice_paste_btn"))
+            self.assertTrue(hasattr(app, "style_paste_btn"))
+
+            # Simulate typing custom voice
+            app.voice_var.set("Zali")
+            app._on_panel_voice_change()
+            self.assertEqual(app.last_applied_voice, "Zali")
+
+            # Simulate pasting custom voice
+            root.clipboard_clear()
+            root.clipboard_append("CustomNarrator")
+            app._paste_voice()
+            self.assertEqual(app.voice_var.get(), "CustomNarrator")
+            self.assertEqual(app.last_applied_voice, "CustomNarrator")
+
+            # Simulate pasting custom style
+            root.clipboard_clear()
+            root.clipboard_append("Excited and dramatic storytelling")
+            app._paste_style()
+            self.assertEqual(app.style_var.get(), "Excited and dramatic storytelling")
+            self.assertEqual(app.last_applied_style, "Excited and dramatic storytelling")
+        finally:
+            root.destroy()
+
+
 class TestSelfTestFunction(unittest.TestCase):
     def test_run_selftest_passes(self):
         exit_code = run_selftest()

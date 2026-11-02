@@ -933,29 +933,43 @@ class TTSBatchApp:
         settings_card = ttk.LabelFrame(main_container, text=" Voice & Style Settings for Selected File(s) ", padding="8")
         settings_card.pack(fill=tk.X, pady=(0, 8))
 
+        # Voice: editable Combobox + Paste button
         ttk.Label(settings_card, text="Voice:", style="Card.TLabel").grid(row=0, column=0, padx=(4, 6), sticky=tk.W)
         self.voice_var = tk.StringVar(value=self.last_applied_voice)
         self.voice_cb = ttk.Combobox(
-            settings_card, textvariable=self.voice_var, values=VOICES, state="readonly", width=16
+            settings_card, textvariable=self.voice_var, values=VOICES, state="normal", width=14
         )
-        self.voice_cb.grid(row=0, column=1, padx=(0, 16), sticky=tk.W)
+        self.voice_cb.grid(row=0, column=1, padx=(0, 4), sticky=tk.W)
         self.voice_cb.bind("<<ComboboxSelected>>", self._on_panel_voice_change)
+        self.voice_cb.bind("<Return>", self._on_panel_voice_change)
+        self.voice_cb.bind("<FocusOut>", self._on_panel_voice_focus_out)
 
-        ttk.Label(settings_card, text="Style:", style="Card.TLabel").grid(row=0, column=2, padx=(0, 6), sticky=tk.W)
+        self.voice_paste_btn = ttk.Button(
+            settings_card, text="Paste", command=self._paste_voice, style="Secondary.TButton"
+        )
+        self.voice_paste_btn.grid(row=0, column=2, padx=(0, 16), sticky=tk.W)
+
+        # Style: editable Combobox + Paste button
+        ttk.Label(settings_card, text="Style:", style="Card.TLabel").grid(row=0, column=3, padx=(0, 6), sticky=tk.W)
         self.style_var = tk.StringVar(value=self.last_applied_style)
         self.style_cb = ttk.Combobox(
-            settings_card, textvariable=self.style_var, values=list(STYLE_PRESETS.keys()), state="normal", width=28
+            settings_card, textvariable=self.style_var, values=list(STYLE_PRESETS.keys()), state="normal", width=22
         )
-        self.style_cb.grid(row=0, column=3, padx=(0, 16), sticky=tk.W)
+        self.style_cb.grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
         self.style_cb.bind("<<ComboboxSelected>>", self._on_panel_style_change)
         self.style_cb.bind("<Return>", self._on_panel_style_change)
         self.style_cb.bind("<FocusOut>", self._on_panel_style_focus_out)
 
+        self.style_paste_btn = ttk.Button(
+            settings_card, text="Paste", command=self._paste_style, style="Secondary.TButton"
+        )
+        self.style_paste_btn.grid(row=0, column=5, padx=(0, 16), sticky=tk.W)
+
         self.apply_btn = ttk.Button(settings_card, text="Apply to Selected", command=self._apply_settings, style="Secondary.TButton")
-        self.apply_btn.grid(row=0, column=4, padx=(0, 6))
+        self.apply_btn.grid(row=0, column=6, padx=(0, 6))
 
         self.apply_all_btn = ttk.Button(settings_card, text="Apply to All", command=self._apply_to_all, style="Secondary.TButton")
-        self.apply_all_btn.grid(row=0, column=5)
+        self.apply_all_btn.grid(row=0, column=7)
 
         # --------------------------------------------------------------------
         # Row 4: Action & Progress Row
@@ -1023,7 +1037,8 @@ class TTSBatchApp:
 
         # Attach universal clipboard handling (context menu & keycodes)
         self._attach_universal_clipboard(self.api_entry)
-        self._attach_universal_clipboard(self.style_cb)
+        self._attach_universal_clipboard(self.voice_cb, on_change=self._on_panel_voice_change)
+        self._attach_universal_clipboard(self.style_cb, on_change=self._on_panel_style_change)
         self._attach_log_clipboard(self.log_text)
 
     # ------------------------------------------------------------------------
@@ -1054,7 +1069,7 @@ class TTSBatchApp:
             self.active_cell_editor = None
 
         if column == "#2":
-            self._edit_grid_cell(row_id, column, "voice", VOICES, is_readonly=True)
+            self._edit_grid_cell(row_id, column, "voice", VOICES, is_readonly=False)
         elif column == "#3":
             self._edit_grid_cell(row_id, column, "style", list(STYLE_PRESETS.keys()), is_readonly=False)
 
@@ -1073,7 +1088,11 @@ class TTSBatchApp:
         cb.set(current_val)
         cb.place(x=x, y=y, width=width, height=height)
         cb.focus_set()
+        if not is_readonly:
+            cb.select_range(0, tk.END)
+            cb.icursor(tk.END)
         self.active_cell_editor = cb
+        self._attach_universal_clipboard(cb)
 
         def commit(evt=None):
             if not cb.winfo_exists():
@@ -1134,6 +1153,19 @@ class TTSBatchApp:
                 self.tree.set(item, "voice", new_val)
             self.log(f"Auto-applied Voice '{new_val}' to {len(selected)} selected file(s).", "info")
 
+    def _on_panel_voice_focus_out(self, event=None):
+        if self._is_programmatic_update or self.is_processing:
+            return
+        def check():
+            try:
+                fw = self.root.focus_get()
+                if fw and ("combobox" in str(fw).lower() or "listbox" in str(fw).lower()):
+                    return
+                self._on_panel_voice_change()
+            except Exception:
+                pass
+        self.root.after(120, check)
+
     def _on_panel_style_change(self, event=None):
         if self._is_programmatic_update or self.is_processing:
             return
@@ -1168,6 +1200,34 @@ class TTSBatchApp:
             if clip:
                 self.api_key_var.set(clip)
                 self.log("Pasted API key from clipboard.", "ok")
+            else:
+                messagebox.showinfo("Clipboard Empty", "The clipboard does not contain any text.")
+        except Exception as exc:
+            messagebox.showinfo("Clipboard Notice", f"Unable to read clipboard: {exc}")
+
+    def _paste_voice(self):
+        try:
+            clip = self.root.clipboard_get().strip()
+            if clip:
+                clean_voice = clip.splitlines()[0].strip()
+                if clean_voice:
+                    self.voice_var.set(clean_voice)
+                    self._on_panel_voice_change()
+                    self.log(f"Pasted Voice '{clean_voice}' from clipboard.", "ok")
+            else:
+                messagebox.showinfo("Clipboard Empty", "The clipboard does not contain any text.")
+        except Exception as exc:
+            messagebox.showinfo("Clipboard Notice", f"Unable to read clipboard: {exc}")
+
+    def _paste_style(self):
+        try:
+            clip = self.root.clipboard_get().strip()
+            if clip:
+                clean_style = " ".join(clip.splitlines()).strip()
+                if clean_style:
+                    self.style_var.set(clean_style)
+                    self._on_panel_style_change()
+                    self.log(f"Pasted Style '{clean_style}' from clipboard.", "ok")
             else:
                 messagebox.showinfo("Clipboard Empty", "The clipboard does not contain any text.")
         except Exception as exc:
@@ -1255,7 +1315,7 @@ class TTSBatchApp:
 
         widget.bind("<Control-KeyPress>", on_ctrl_key)
 
-    def _attach_universal_clipboard(self, widget: tk.Widget):
+    def _attach_universal_clipboard(self, widget: tk.Widget, on_change=None):
         """Attach right-click context menu and keyboard-layout-independent shortcuts."""
         menu = tk.Menu(
             widget,
@@ -1268,46 +1328,59 @@ class TTSBatchApp:
             relief="solid",
         )
 
-        def do_paste():
+        def do_paste(event=None):
             try:
                 clip = self.root.clipboard_get()
-                try:
-                    widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                except tk.TclError:
-                    pass
-                widget.insert(tk.INSERT, clip)
+                if clip is not None:
+                    clean_clip = clip.strip("\r\n")
+                    try:
+                        widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                    except tk.TclError:
+                        pass
+                    widget.insert(tk.INSERT, clean_clip)
+                    if on_change:
+                        on_change()
             except Exception:
                 pass
+            return "break"
 
-        def do_copy():
+        def do_copy(event=None):
             try:
                 sel = widget.selection_get()
                 self.root.clipboard_clear()
                 self.root.clipboard_append(sel)
             except Exception:
                 pass
+            return "break"
 
-        def do_cut():
+        def do_cut(event=None):
             try:
                 sel = widget.selection_get()
                 self.root.clipboard_clear()
                 self.root.clipboard_append(sel)
                 widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                if on_change:
+                    on_change()
             except Exception:
                 pass
+            return "break"
 
-        def do_select_all():
+        def do_select_all(event=None):
             try:
                 widget.select_range(0, tk.END)
                 widget.icursor(tk.END)
             except Exception:
                 pass
+            return "break"
 
-        def do_clear():
+        def do_clear(event=None):
             try:
                 widget.delete(0, tk.END)
+                if on_change:
+                    on_change()
             except Exception:
                 pass
+            return "break"
 
         menu.add_command(label="Paste", command=do_paste)
         menu.add_command(label="Copy", command=do_copy)
@@ -1318,27 +1391,41 @@ class TTSBatchApp:
 
         def show_popup(event):
             try:
+                widget.focus_set()
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
                 menu.grab_release()
 
         widget.bind("<Button-3>", show_popup)
 
+        widget.bind("<<Paste>>", do_paste)
+        widget.bind("<<Copy>>", do_copy)
+        widget.bind("<<Cut>>", do_cut)
+        widget.bind("<<SelectAll>>", do_select_all)
+
+        widget.bind("<Control-v>", do_paste)
+        widget.bind("<Control-V>", do_paste)
+        widget.bind("<Shift-Insert>", do_paste)
+        widget.bind("<Control-c>", do_copy)
+        widget.bind("<Control-C>", do_copy)
+        widget.bind("<Control-x>", do_cut)
+        widget.bind("<Control-X>", do_cut)
+        widget.bind("<Control-a>", do_select_all)
+        widget.bind("<Control-A>", do_select_all)
+
         def on_ctrl_key(event):
             if event.state & 4:
-                # 86 = Keycode for 'V' on Windows across all keyboard layouts
-                if event.keycode == 86:
-                    do_paste()
-                    return "break"
-                elif event.keycode == 67:
-                    do_copy()
-                    return "break"
-                elif event.keycode == 88:
-                    do_cut()
-                    return "break"
-                elif event.keycode == 65:
-                    do_select_all()
-                    return "break"
+                k = getattr(event, "keysym", "").lower()
+                code = getattr(event, "keycode", 0)
+                # 86 = 'V', 67 = 'C', 88 = 'X', 65 = 'A' across Windows keyboards
+                if code == 86 or k == "v":
+                    return do_paste(event)
+                elif code == 67 or k == "c":
+                    return do_copy(event)
+                elif code == 88 or k == "x":
+                    return do_cut(event)
+                elif code == 65 or k == "a":
+                    return do_select_all(event)
 
         widget.bind("<Control-KeyPress>", on_ctrl_key)
 
@@ -1514,6 +1601,8 @@ class TTSBatchApp:
         self.clear_btn.configure(state="disabled")
         self.apply_btn.configure(state="disabled")
         self.apply_all_btn.configure(state="disabled")
+        self.voice_paste_btn.configure(state="disabled")
+        self.style_paste_btn.configure(state="disabled")
 
         self.progress_bar.configure(value=0, maximum=100)
         self.progress_label.configure(text="Starting...")
@@ -1973,6 +2062,8 @@ class TTSBatchApp:
         self.clear_btn.configure(state="normal")
         self.apply_btn.configure(state="normal")
         self.apply_all_btn.configure(state="normal")
+        self.voice_paste_btn.configure(state="normal")
+        self.style_paste_btn.configure(state="normal")
 
         if was_stopped:
             self.progress_label.configure(text="Stopped")
