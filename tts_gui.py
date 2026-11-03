@@ -43,9 +43,8 @@ from google.genai import errors
 APP_NAME = "Text to Speech Batch"
 APP_SUBTITLE = "AI Audio Studio"
 
-PRIMARY_MODEL = "gemini-3.8-flash-tts"
-FALLBACK_MODEL = "gemini-3.8-flash-lite-tts"
-MODEL_NAME = PRIMARY_MODEL
+MODEL_NAME = "gemini-3.8-flash-tts"
+PRIMARY_MODEL = MODEL_NAME
 MAX_API_KEYS = 10
 MAX_CHARS = 1500
 MP3_BITRATE_KBPS = 64
@@ -390,7 +389,7 @@ def extract_retry_delay(exc: Exception, attempt: int, default_sequence: list[flo
 # ============================================================================
 
 class ApiKeyPool:
-    """Manages round-robin rotation and per-model daily quota tracking across up to 10 Gemini API keys."""
+    """Manages round-robin rotation and daily quota tracking across up to 10 Gemini API keys for MODEL_NAME."""
 
     def __init__(self, keys: list[str]):
         seen = set()
@@ -404,10 +403,9 @@ class ApiKeyPool:
                     break
         self.keys: list[str] = deduped
         self.current_idx: int = 0
-        self.exhausted_primary: set[str] = set()
-        self.exhausted_fallback: set[str] = set()
+        self.exhausted_keys: set[str] = set()
         self.invalid_keys: set[str] = set()
-        self.active_model: str = PRIMARY_MODEL
+        self.active_model: str = MODEL_NAME
         self._clients: dict[str, genai.Client] = {}
 
     def get_client(self, api_key: str) -> genai.Client:
@@ -430,14 +428,11 @@ class ApiKeyPool:
     def get_active_model(self) -> str:
         return self.active_model
 
-    def shift_to_fallback(self) -> None:
-        self.active_model = FALLBACK_MODEL
-
     def is_all_exhausted(self) -> bool:
         valid_keys = [k for k in self.keys if k not in self.invalid_keys]
         if not valid_keys:
             return True
-        return all(k in self.exhausted_primary for k in valid_keys) and all(k in self.exhausted_fallback for k in valid_keys)
+        return all(k in self.exhausted_keys for k in valid_keys)
 
     def key_index(self, api_key: str) -> int:
         try:
@@ -451,56 +446,37 @@ class ApiKeyPool:
         if not valid_keys:
             return None
 
-        # Stage 1: Round-robin across keys for PRIMARY_MODEL
-        if self.active_model == PRIMARY_MODEL:
-            primary_candidates = [k for k in valid_keys if k not in self.exhausted_primary]
-            if primary_candidates:
-                for _ in range(len(self.keys)):
-                    candidate = self.keys[self.current_idx % len(self.keys)]
-                    self.current_idx = (self.current_idx + 1) % len(self.keys)
-                    if candidate in primary_candidates:
-                        idx = self.keys.index(candidate) + 1
-                        return candidate, PRIMARY_MODEL, idx
+        candidates = [k for k in valid_keys if k not in self.exhausted_keys]
+        if not candidates:
+            return None
 
-            # All valid keys exhausted for PRIMARY_MODEL -> shift to FALLBACK_MODEL!
-            self.active_model = FALLBACK_MODEL
+        for _ in range(len(self.keys)):
+            candidate = self.keys[self.current_idx % len(self.keys)]
+            self.current_idx = (self.current_idx + 1) % len(self.keys)
+            if candidate in candidates:
+                idx = self.keys.index(candidate) + 1
+                return candidate, MODEL_NAME, idx
 
-        # Stage 2: Round-robin across keys for FALLBACK_MODEL
-        if self.active_model == FALLBACK_MODEL:
-            fallback_candidates = [k for k in valid_keys if k not in self.exhausted_fallback]
-            if fallback_candidates:
-                for _ in range(len(self.keys)):
-                    candidate = self.keys[self.current_idx % len(self.keys)]
-                    self.current_idx = (self.current_idx + 1) % len(self.keys)
-                    if candidate in fallback_candidates:
-                        idx = self.keys.index(candidate) + 1
-                        return candidate, FALLBACK_MODEL, idx
-
-        # All keys exhausted on both models!
         return None
 
-    def mark_quota_daily(self, api_key: str, model_name: str) -> tuple[bool, str]:
-        """Mark daily quota exhausted for an API key on a model.
-        
+    def mark_quota_daily(self, api_key: str, model_name: str = MODEL_NAME) -> tuple[bool, str]:
+        """Mark daily quota exhausted for an API key on MODEL_NAME.
+
         Returns:
-            (all_keys_exhausted_on_this_model, log_message)
+            (all_keys_exhausted, log_message)
         """
         valid_keys = [k for k in self.keys if k not in self.invalid_keys]
         key_num = self.keys.index(api_key) + 1 if api_key in self.keys else 1
 
-        if model_name == PRIMARY_MODEL:
-            self.exhausted_primary.add(api_key)
-            all_primary = all(k in self.exhausted_primary for k in valid_keys)
-            if all_primary:
-                self.active_model = FALLBACK_MODEL
-                return True, f"Daily quota exhausted across all {len(valid_keys)} API key(s) on primary model '{PRIMARY_MODEL}'."
-            return False, f"API key #{key_num} exhausted daily quota for '{PRIMARY_MODEL}'. Shifting to next key..."
-        else:
-            self.exhausted_fallback.add(api_key)
-            all_fallback = all(k in self.exhausted_fallback for k in valid_keys)
-            if all_fallback:
-                return True, f"Daily quota exhausted across all {len(valid_keys)} API key(s) on fallback model '{FALLBACK_MODEL}'."
-            return False, f"API key #{key_num} exhausted daily quota for '{FALLBACK_MODEL}'. Shifting to next key..."
+        self.exhausted_keys.add(api_key)
+        all_exhausted = all(k in self.exhausted_keys for k in valid_keys)
+        if all_exhausted:
+            return True, f"Daily quota exhausted across all {len(valid_keys)} API key(s) on model '{MODEL_NAME}'."
+        return False, f"API key #{key_num} exhausted daily quota for '{MODEL_NAME}'. Shifting to next key..."
+
+    def mark_invalid(self, api_key: str):
+        """Mark an API key as invalid (e.g. auth error)."""
+        self.invalid_keys.add(api_key)
 
     def mark_invalid(self, api_key: str):
         """Mark an API key as invalid (e.g. auth error)."""
@@ -847,7 +823,7 @@ class TTSBatchApp:
         self._build_ui()
 
         # Initial greeting in the log
-        self.log(f"{APP_NAME} initialized (Primary: {PRIMARY_MODEL}, Fallback: {FALLBACK_MODEL}). Ready for batch processing.", "ok")
+        self.log(f"{APP_NAME} initialized (Model: {MODEL_NAME}). Ready for batch processing.", "ok")
 
         # Load persisted API keys (up to 10)
         self.api_keys_list = load_api_keys()
@@ -1392,8 +1368,8 @@ class TTSBatchApp:
 
         info_text = (
             "Define up to 10 Gemini API keys for seamless batch processing:\n"
-            "• Stage 1: The engine rotates requests across all active keys in round-robin order using 'gemini-3.8-flash-tts'.\n"
-            "• Stage 2: When daily quota is reached on all keys, it automatically shifts to 'gemini-3.8-flash-lite-tts' across all keys."
+            "• Round-Robin Pool: Requests automatically rotate across all active keys using 'gemini-3.8-flash-tts'.\n"
+            "• Quota Failover: If any key exhausts its daily quota, the engine seamlessly switches to the next active key."
         )
         info_lbl = ttk.Label(
             header_frame,
@@ -2034,7 +2010,7 @@ class TTSBatchApp:
             self.queue.put(("log", f"Initialized Gemini API key pool with {key_count} active key(s).", "info"))
             self.queue.put((
                 "log",
-                f"Primary model: '{PRIMARY_MODEL}' | Fallback model: '{FALLBACK_MODEL}'.",
+                f"Active model: '{MODEL_NAME}'.",
                 "ok",
             ))
 
@@ -2398,35 +2374,18 @@ class TTSBatchApp:
 
                 err_info = classify_error(exc)
 
-                # Automatic fallback from PRIMARY_MODEL to FALLBACK_MODEL on daily quota exhaustion or model unavailability
+                # Daily quota exhaustion handling across API keys in pool
                 if err_info.kind == "quota_daily":
                     all_exhausted, notice = pool.mark_quota_daily(current_api_key, current_model)
                     self.queue.put(("log", notice, "warn"))
-                    if all_exhausted and current_model == PRIMARY_MODEL:
-                        self.queue.put((
-                            "log",
-                            f"Daily quota reached on all keys for '{PRIMARY_MODEL}'. Automatically shifting to fallback model '{FALLBACK_MODEL}' across all keys...",
-                            "warn",
-                        ))
                     self.active_model = pool.get_active_model()
                     if pool.is_all_exhausted():
-                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("quota_daily", "Daily quota exhausted across all configured API keys on both primary and fallback models."), saw_rate_limit, pool.get_active_model()
+                        return b"", DEFAULT_SAMPLE_RATE, ErrorInfo("quota_daily", f"Daily quota exhausted across all configured API keys for '{MODEL_NAME}'."), saw_rate_limit, pool.get_active_model()
                     time.sleep(0.3)
                     continue
 
                 if err_info.kind == "model_not_found":
-                    if current_model == PRIMARY_MODEL:
-                        self.queue.put((
-                            "log",
-                            f"Primary model '{PRIMARY_MODEL}' not found. Shifting all keys to fallback model '{FALLBACK_MODEL}'...",
-                            "warn",
-                        ))
-                        pool.shift_to_fallback()
-                        self.active_model = FALLBACK_MODEL
-                        time.sleep(0.3)
-                        continue
-                    else:
-                        return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit, current_model
+                    return b"", DEFAULT_SAMPLE_RATE, err_info, saw_rate_limit, current_model
 
                 if err_info.kind == "auth":
                     pool.mark_invalid(current_api_key)
@@ -2642,15 +2601,16 @@ def run_selftest() -> int:
         pool = ApiKeyPool(["keyA", "keyB"])
         c1 = pool.get_next_key_and_model()
         c2 = pool.get_next_key_and_model()
-        pool.mark_quota_daily("keyA", PRIMARY_MODEL)
-        pool.mark_quota_daily("keyB", PRIMARY_MODEL)
+        pool.mark_quota_daily("keyA", MODEL_NAME)
         c3 = pool.get_next_key_and_model()
+        pool.mark_quota_daily("keyB", MODEL_NAME)
+        c4 = pool.get_next_key_and_model()
         record(
-            "ApiKeyPool rotation and fallback shift",
-            c1[0] == "keyA" and c2[0] == "keyB" and c3[1] == FALLBACK_MODEL,
+            "ApiKeyPool round-robin rotation and quota handling",
+            c1[0] == "keyA" and c2[0] == "keyB" and c3[0] == "keyB" and c4 is None and pool.is_all_exhausted(),
         )
     except Exception as exc:
-        record("ApiKeyPool rotation and fallback shift", False, str(exc))
+        record("ApiKeyPool round-robin rotation and quota handling", False, str(exc))
 
     try:
         with open(log_path, "w", encoding="utf-8") as f:

@@ -45,8 +45,8 @@ from tts_gui import (
     save_api_keys,
     load_api_keys,
     MAX_API_KEYS,
+    MODEL_NAME,
     PRIMARY_MODEL,
-    FALLBACK_MODEL,
 )
 
 
@@ -463,50 +463,47 @@ class TestCustomVoiceAndUI(unittest.TestCase):
             root.destroy()
 
 
-class TestModelFallback(unittest.TestCase):
+class TestModelConfig(unittest.TestCase):
     def test_model_constants(self):
-        self.assertEqual(tts_gui.PRIMARY_MODEL, "gemini-3.8-flash-tts")
-        self.assertEqual(tts_gui.FALLBACK_MODEL, "gemini-3.8-flash-lite-tts")
         self.assertEqual(tts_gui.MODEL_NAME, "gemini-3.8-flash-tts")
+        self.assertEqual(tts_gui.PRIMARY_MODEL, "gemini-3.8-flash-tts")
 
-    def test_fallback_on_quota_daily(self):
+    def test_quota_daily_exhaustion_halts(self):
         import tkinter as tk
-        from unittest.mock import MagicMock
         root = tk.Tk()
         root.withdraw()
         try:
             app = tts_gui.TTSBatchApp(root)
-            self.assertEqual(app.active_model, tts_gui.PRIMARY_MODEL)
+            self.assertEqual(app.active_model, tts_gui.MODEL_NAME)
 
-            # Create a mock client that raises quota_daily on PRIMARY_MODEL, but succeeds on FALLBACK_MODEL
+            # Create a mock client that raises quota_daily on MODEL_NAME
             class MockClient:
                 def __init__(self):
                     self.models = self
 
                 def generate_content_stream(self, model, contents, config):
-                    if model == tts_gui.PRIMARY_MODEL:
-                        raise APIError(429, {"error": {"code": 429, "message": "Quota exceeded for quota metric per day"}})
-                    chunk_mock = MagicMock()
-                    chunk_mock.parts = [MagicMock(inline_data=MagicMock(data=b"\x00" * 200, mime_type="audio/pcm"))]
-                    return [chunk_mock]
+                    raise APIError(429, {"error": {"code": 429, "message": "Quota exceeded for quota metric per day"}})
 
             client = MockClient()
+            pool = ApiKeyPool(["k1"])
+            pool._clients["k1"] = client
             pcm, rate, err, was_rl, active_model = app._fetch_audio_chunk_with_retry(
                 client=client,
-                chunk_text="Test fallback chunk",
+                chunk_text="Test chunk",
                 voice="Bodi",
                 clean_style="",
                 is_mock=False,
                 chunk_idx=1,
                 total_chunks=1,
-                active_model=tts_gui.PRIMARY_MODEL,
+                active_model=tts_gui.MODEL_NAME,
+                pool=pool,
             )
 
-            # Verify it automatically shifted to FALLBACK_MODEL and succeeded
-            self.assertEqual(active_model, tts_gui.FALLBACK_MODEL)
-            self.assertEqual(app.active_model, tts_gui.FALLBACK_MODEL)
-            self.assertIsNone(err)
-            self.assertGreater(len(pcm), 0)
+            # Verify it marked quota_daily, halted and did not shift to any other model
+            self.assertEqual(active_model, tts_gui.MODEL_NAME)
+            self.assertIsNotNone(err)
+            self.assertEqual(err.kind, "quota_daily")
+            self.assertTrue(pool.is_all_exhausted())
         finally:
             root.destroy()
 
@@ -521,7 +518,7 @@ class TestApiKeyPoolAndRotation(unittest.TestCase):
         self.assertEqual(pool.keys[2], "k3")
         self.assertEqual(pool.keys[3], "k4")
 
-    def test_round_robin_rotation_primary_model(self):
+    def test_round_robin_rotation(self):
         keys = ["key1", "key2", "key3"]
         pool = ApiKeyPool(keys)
 
@@ -530,52 +527,34 @@ class TestApiKeyPoolAndRotation(unittest.TestCase):
         c3 = pool.get_next_key_and_model()
         c4 = pool.get_next_key_and_model()
 
-        self.assertEqual(c1, ("key1", PRIMARY_MODEL, 1))
-        self.assertEqual(c2, ("key2", PRIMARY_MODEL, 2))
-        self.assertEqual(c3, ("key3", PRIMARY_MODEL, 3))
-        self.assertEqual(c4, ("key1", PRIMARY_MODEL, 1))
+        self.assertEqual(c1, ("key1", MODEL_NAME, 1))
+        self.assertEqual(c2, ("key2", MODEL_NAME, 2))
+        self.assertEqual(c3, ("key3", MODEL_NAME, 3))
+        self.assertEqual(c4, ("key1", MODEL_NAME, 1))
 
-    def test_single_key_exhaustion_on_primary_model(self):
+    def test_single_key_exhaustion(self):
         keys = ["keyA", "keyB", "keyC"]
         pool = ApiKeyPool(keys)
 
-        all_exhausted, notice = pool.mark_quota_daily("keyB", PRIMARY_MODEL)
+        all_exhausted, notice = pool.mark_quota_daily("keyB", MODEL_NAME)
         self.assertFalse(all_exhausted)
-        self.assertEqual(pool.get_active_model(), PRIMARY_MODEL)
+        self.assertEqual(pool.get_active_model(), MODEL_NAME)
 
         results = [pool.get_next_key_and_model()[0] for _ in range(4)]
         self.assertNotIn("keyB", results)
         self.assertIn("keyA", results)
         self.assertIn("keyC", results)
 
-    def test_all_keys_exhaustion_shifts_to_fallback_model(self):
+    def test_all_keys_exhaustion_returns_none(self):
         keys = ["key1", "key2"]
         pool = ApiKeyPool(keys)
 
-        all_ex1, _ = pool.mark_quota_daily("key1", PRIMARY_MODEL)
+        all_ex1, _ = pool.mark_quota_daily("key1", MODEL_NAME)
         self.assertFalse(all_ex1)
+        self.assertFalse(pool.is_all_exhausted())
 
-        all_ex2, _ = pool.mark_quota_daily("key2", PRIMARY_MODEL)
+        all_ex2, _ = pool.mark_quota_daily("key2", MODEL_NAME)
         self.assertTrue(all_ex2)
-        self.assertEqual(pool.get_active_model(), FALLBACK_MODEL)
-
-        c1 = pool.get_next_key_and_model()
-        c2 = pool.get_next_key_and_model()
-        c3 = pool.get_next_key_and_model()
-
-        self.assertEqual(c1, ("key1", FALLBACK_MODEL, 1))
-        self.assertEqual(c2, ("key2", FALLBACK_MODEL, 2))
-        self.assertEqual(c3, ("key1", FALLBACK_MODEL, 1))
-
-    def test_both_models_exhausted_returns_none(self):
-        keys = ["k1"]
-        pool = ApiKeyPool(keys)
-
-        pool.mark_quota_daily("k1", PRIMARY_MODEL)
-        self.assertEqual(pool.get_active_model(), FALLBACK_MODEL)
-
-        all_ex, _ = pool.mark_quota_daily("k1", FALLBACK_MODEL)
-        self.assertTrue(all_ex)
         self.assertTrue(pool.is_all_exhausted())
         self.assertIsNone(pool.get_next_key_and_model())
 
