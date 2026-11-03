@@ -53,6 +53,7 @@ DEFAULT_SAMPLE_RATE = 24000
 CHUNK_GAP_SECONDS = 0.3
 CACHE_EXPIRY_DAYS = 7
 MIN_RATE_LIMIT_INTERVAL = 20.0
+CHUNK_REQUEST_DELAY_SECONDS = 10.0
 
 # Color Palette (Modern Dark Windows Studio)
 COLOR_WINDOW_BG = "#1e1e24"
@@ -2161,11 +2162,13 @@ class TTSBatchApp:
                     chunk_pcm = b""
 
                 if not chunk_pcm:
-                    # Enforce inter-request rate limit spacing if a 429 was seen
-                    if min_request_interval > 0.0 and not is_mock:
+                    # Enforce cooldown delay between consecutive API chunk requests to prevent rate limits
+                    if last_request_time > 0.0 and not is_mock:
+                        target_delay = max(CHUNK_REQUEST_DELAY_SECONDS, min_request_interval)
                         elapsed = time.time() - last_request_time
-                        if elapsed < min_request_interval:
-                            wait_gap = min_request_interval - elapsed
+                        if elapsed < target_delay:
+                            wait_gap = target_delay - elapsed
+                            self.queue.put(("log", f"  Waiting {wait_gap:.1f}s cooldown before sending chunk {idx}/{num_chunks} to prevent rate limits...", "sub"))
                             gap_slept = 0.0
                             while gap_slept < wait_gap:
                                 if self.stop_event.is_set():
@@ -2178,7 +2181,6 @@ class TTSBatchApp:
                         self.queue.put(("item_status", item_id, f"Stopped ({chunks_completed_for_file}/{num_chunks} chunks)"))
                         break
 
-                    last_request_time = time.time()
                     chunk_pcm, chunk_rate, err_info, was_rate_limited, active_model = self._fetch_audio_chunk_with_retry(
                         client=None,
                         chunk_text=chunk,
@@ -2190,6 +2192,7 @@ class TTSBatchApp:
                         active_model=pool.get_active_model(),
                         pool=pool,
                     )
+                    last_request_time = time.time()
 
                     if was_rate_limited:
                         min_request_interval = MIN_RATE_LIMIT_INTERVAL

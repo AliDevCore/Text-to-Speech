@@ -47,6 +47,7 @@ from tts_gui import (
     MAX_API_KEYS,
     MODEL_NAME,
     PRIMARY_MODEL,
+    CHUNK_REQUEST_DELAY_SECONDS,
 )
 
 
@@ -467,6 +468,7 @@ class TestModelConfig(unittest.TestCase):
     def test_model_constants(self):
         self.assertEqual(tts_gui.MODEL_NAME, "gemini-3.8-flash-tts")
         self.assertEqual(tts_gui.PRIMARY_MODEL, "gemini-3.8-flash-tts")
+        self.assertEqual(tts_gui.CHUNK_REQUEST_DELAY_SECONDS, 10.0)
 
     def test_quota_daily_exhaustion_halts(self):
         import tkinter as tk
